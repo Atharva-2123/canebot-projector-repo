@@ -21,7 +21,7 @@ projector/
 omega/
   omega                     the binary
   omega-config.yaml         which tables to replicate and how
-  omega-env.sh              template — copy to omega.env and fill in
+  omega.env.example         template — copy to omega.env
   certs/                    ca.crt, device.crt, device.key       (secrets, gitignored)
   state.db                  omega's own cursors                  (runtime, gitignored)
 
@@ -46,8 +46,7 @@ sudo systemctl start canebot-projector
 ./linux/manage-services.sh check
 
 # 3. omega — needs certs and device details first
-cp omega/omega-env.sh omega/omega.env
-nano omega/omega.env                    # broker URL, device NAME, topic slug
+cp omega/omega.env.example omega/omega.env   # already filled in for this device
 cp /path/to/{ca.crt,device.crt,device.key} omega/certs/
 chmod 600 omega/certs/device.key
 sudo systemctl start canebot-omega

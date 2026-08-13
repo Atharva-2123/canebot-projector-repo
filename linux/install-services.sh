@@ -85,5 +85,5 @@ echo "Installed. The projector can start now:"
 echo "  sudo systemctl start canebot-projector"
 echo
 echo "omega needs certs in omega/certs/ and omega/omega.env filled in first:"
-echo "  cp ${ROOT}/omega/omega-env.sh ${ROOT}/omega/omega.env   # then edit"
+echo "  cp ${ROOT}/omega/omega.env.example ${ROOT}/omega/omega.env"
 echo "  sudo systemctl start canebot-omega"
