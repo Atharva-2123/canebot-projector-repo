@@ -1,21 +1,39 @@
 #!/usr/bin/env bash
-# Source before running omega:  source omega-env.sh
+# Copy to omega.env on the device and fill in the two TODOs, then:
+#   sudo systemctl start canebot-omega
 #
-# Fill these from the device's MQTT connection details in the Golain console.
+# omega.env is gitignored — it is per-device.
 
-# The device NAME as registered — NOT its UUID. Using the UUID is the single most
-# common cause of "connects fine, nothing ever ingests".
-export OMEGA_DEVICE_ID="canebot-pi-01"
+# ── Device identity ──────────────────────────────────────────────────────────
+# Must be the device NAME exactly as registered (the console calls it Client ID),
+# not its UUID. The broker resolves tenancy from the certificate and matches the
+# topic ACL against this — a UUID here connects fine and then ingests nothing.
+export OMEGA_DEVICE_ID="CaneBot Vending Machine 1"
 
-export OMEGA_MQTT_BROKER_URL="ssl://<broker-host>:8883"    # quic://…:8884 if the cert is ECDSA
-export OMEGA_ROOT_TOPIC="<topic_slug>/canebot-pi-01"
+# ── Broker ───────────────────────────────────────────────────────────────────
+# TLS is the safe default. QUIC is also enabled on this device
+# (quic://mqtt.ilyama.golain.io:14567) and gives faster reconnects and no
+# head-of-line blocking across lineages — worth trying once TLS is proven,
+# since we have 17 lineages sharing the link.
+export OMEGA_MQTT_BROKER_URL="ssl://mqtt.ilyama.golain.io:8883"
 
-export OMEGA_TLS_CA_PATH="$(dirname "${BASH_SOURCE[0]}")/certs/ca.crt"
-export OMEGA_TLS_CERT_PATH="$(dirname "${BASH_SOURCE[0]}")/certs/device.crt"
-export OMEGA_TLS_KEY_PATH="$(dirname "${BASH_SOURCE[0]}")/certs/device.key"
+# ── Topic prefix ─────────────────────────────────────────────────────────────
+# TODO: {topic_slug}/{device_name} exactly as provisioned. Find it in the console
+# under the device's MQTT details, or via
+#   GET /projects/{project_id}/devices/{device_id}/mqtt_connection_details
+# A wrong value connects but every publish is rejected by the ACL.
+export OMEGA_ROOT_TOPIC="<topic_slug>/CaneBot Vending Machine 1"
 
-# What omega replicates: the PROJECTOR'S OUTPUT, never the machine's own database.
-export OMEGA_SOURCE_DB_PATH="/home/pi/projector/canebot_replica.db"
+# ── Certificates ─────────────────────────────────────────────────────────────
+# TODO: confirm these filenames match what the console issued.
+_CERTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/certs"
+export OMEGA_TLS_CA_PATH="${_CERTS}/ca.crt"
+export OMEGA_TLS_CERT_PATH="${_CERTS}/device.crt"
+export OMEGA_TLS_KEY_PATH="${_CERTS}/device.key"
 
-# omega's own cursors. Separate from the projector's projector_state.db.
-export OMEGA_STATE_DB_PATH="/home/pi/projector/omega_state.db"
+# ── Databases ────────────────────────────────────────────────────────────────
+# omega replicates the PROJECTOR'S OUTPUT, never the machine's own config.db.
+export OMEGA_SOURCE_DB_PATH="/home/pi/projector/canebot-projector-repo/projector/canebot_replica.db"
+
+# omega's own cursors — separate from the projector's projector_state.db.
+export OMEGA_STATE_DB_PATH="/home/pi/projector/canebot-projector-repo/omega/state.db"
