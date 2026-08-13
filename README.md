@@ -1,73 +1,98 @@
-# CaneBot projector
+# CaneBot projector + omega
 
-Reads the CaneBot controller's SQLite database **read-only** and writes a second,
-dashboard-shaped database for edge replication to ilyama.
+Replicates the CaneBot machine's data to ilyama for dashboards.
 
 ```
-config.db ──ro──▶ projector ──▶ canebot_replica.db ──▶ omega ──▶ ilyama ──▶ dashboards
-(the machine's)                 (ours)
+config.db  ──read-only──▶  projector  ──▶  canebot_replica.db  ──▶  omega  ──▶  ilyama
+(the machine's own)                        (dashboard-shaped)
 ```
 
-The controller is never modified, rebuilt, or redeployed. A test asserts its SHA-256 is
-unchanged after every run.
+The controller is never modified, rebuilt or redeployed. A test asserts its SHA-256 is
+unchanged after every projector run.
 
-## Quick start
+## Layout
+
+```
+projector/
+  projector                 the binary
+  canebot_replica.db        output — what omega replicates      (runtime, gitignored)
+  projector_state.db        read cursors and watermarks         (runtime, gitignored)
+
+omega/
+  omega                     the binary
+  omega-config.yaml         which tables to replicate and how
+  omega-env.sh              template — copy to omega.env and fill in
+  certs/                    ca.crt, device.crt, device.key       (secrets, gitignored)
+  state.db                  omega's own cursors                  (runtime, gitignored)
+
+linux/
+  install-services.sh       install both as systemd services
+  manage-services.sh        start / stop / logs / check
+
+db-overview.md              every table and column, and where each comes from
+```
+
+## Install
 
 ```bash
-uname -m          # x86_64 -> amd64,  aarch64 -> arm64
+git clone https://github.com/Atharva-2123/canebot-projector-repo.git
+cd canebot-projector-repo
 
-./bin/projector-linux-amd64 \
-  -source /path/to/config.db \
-  -replica ./canebot_replica.db \
-  -state ./projector_state.db \
-  -once -v
+# 1. projector — safe to start immediately, it only reads
+sudo ./linux/install-services.sh
+sudo systemctl start canebot-projector
+
+# 2. check it is producing
+./linux/manage-services.sh check
+
+# 3. omega — needs certs and device details first
+cp omega/omega-env.sh omega/omega.env
+nano omega/omega.env                    # broker URL, device NAME, topic slug
+cp /path/to/{ca.crt,device.crt,device.key} omega/certs/
+chmod 600 omega/certs/device.key
+sudo systemctl start canebot-omega
 ```
 
-Then check the output and confirm the source is untouched:
+If the controller's database is not at `~/CaneBot_FSM_go/config.db`:
 
 ```bash
+SOURCE_DB=/actual/path/config.db sudo -E ./linux/install-services.sh
+```
+
+## Day to day
+
+```bash
+./linux/manage-services.sh status
+./linux/manage-services.sh check      # row counts, cycle outcomes, integrity
+./linux/manage-services.sh logs       # both services, live
+./linux/manage-services.sh restart
+```
+
+## Try it without installing
+
+The projector opens the controller's database read-only, so this is safe on a live machine.
+
+```bash
+cd projector
+./projector -source /path/to/config.db -once -v
 sqlite3 -header -column canebot_replica.db \
-  "SELECT order_key, result, duration_ms, recipe_id FROM cycles LIMIT 20;"
-sqlite3 canebot_replica.db "PRAGMA foreign_key_check;"    # empty = clean
-sha256sum /path/to/config.db                              # same before and after
+  "SELECT order_key, result, duration_ms FROM cycles LIMIT 20;"
+sha256sum /path/to/config.db          # unchanged before and after
 ```
-
-Install as a service: see [deploy/DEPLOY.md](deploy/DEPLOY.md).
 
 ## What it produces
 
 17 tables. `cycles` is the headline — one row per drink with its duration and outcome, plus
 synthetic intervals covering idle, maintenance, manual and error time so the timeline is
-continuous. Full column-by-column reference in [db-overview.md](db-overview.md).
+continuous and availability is computable. Full reference in [db-overview.md](db-overview.md).
 
-## Two files, two purposes
+## Notes
 
-| File | Role |
-|---|---|
-| `canebot_replica.db` | What omega replicates. Pruned after 14 days — a buffer, not an archive. |
-| `projector_state.db` | Our cursors and watermarks. **Never** add this to a sync policy. Back it up alongside the replica. |
-
-## Status
-
-- 25 tests passing; verified end to end against fabricated data
-- **Not yet run against a real machine database**
+- `projector_state.db` and `omega/state.db` are **separate on purpose**. Neither belongs in a
+  sync policy; omega auto-enrols any table it finds in the database it is pointed at.
+- Back both up alongside the replica. Losing them causes duplicate publishes.
 - Five tables have no writer yet: `cip_runs`, `hourly_rollups`, `hourly_fault_counts`,
-  `hourly_step_stats`, `daily_rollups`
-
-## Source
-
-Lives in `CaneBot_FSM_go/cmd/projector/`. It imports the firmware's own `fsm` and `io`
-packages — step titles come from `fsm.GetStepDescription()` and the door/reset inputs from
-`io.InputMainDoorSwitch` / `io.InputCIPBypassSwitch` — so the labels and addresses cannot
-drift from the machine. Building it standalone requires either that module or a copy of those
-constants.
-
-Build all targets:
-
-```bash
-cd CaneBot_FSM_go
-for t in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
-  GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 \
-    go build -ldflags "-s -w" -o bin/projector-${t%/*}-${t#*/} ./cmd/projector/
-done
-```
+  `hourly_step_stats`, `daily_rollups`.
+- The omega binary is the omnibus build (36 MB). A slim client build is currently impossible
+  because `sqlite-replication` is missing from omega's `modules/modulemap.go`, though it is
+  present in `registry.go` — the two have drifted.

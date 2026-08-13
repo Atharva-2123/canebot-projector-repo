@@ -1,0 +1,71 @@
+# omega client config for CaneBot.
+#
+# omega reads the projector's output and replicates it to ilyama over MQTT. It does NOT read
+# the machine's own database — the projector does that, read-only, and writes canebot_replica.db.
+#
+#   config.db ──ro──▶ projector ──▶ canebot_replica.db ──▶ omega ──▶ ilyama
+#
+# Run:  ./omega-linux-arm64 -client canebot.yaml
+
+name: canebot
+description: CaneBot — replicate the projector's output to ilyama
+platform: linux
+
+connection:
+  transport: mqtt
+  server_url_env: OMEGA_MQTT_BROKER_URL   # from the device's MQTT connection details
+  device_id_env: OMEGA_DEVICE_ID          # the device NAME as registered, not its UUID
+  root_topic_env: OMEGA_ROOT_TOPIC        # {topic_slug}/{device_name}
+  mqtt:
+    keep_alive: 30s
+    # false is required: with a clean session the broker cannot buffer downlink
+    # pause/resume control messages while the device is offline.
+    clean_session: false
+    tls:
+      ca_cert_path_env: OMEGA_TLS_CA_PATH
+      client_cert_path_env: OMEGA_TLS_CERT_PATH
+      client_key_path_env: OMEGA_TLS_KEY_PATH
+
+modules:
+  required:
+    - sqlite-replication
+    - heartbeat
+
+security:
+  max_payload_bytes: 262144
+  capabilities:
+    sqlite-replication: true
+    heartbeat: true
+
+sqlite-replication:
+  source_db_path_env: OMEGA_SOURCE_DB_PATH   # -> canebot_replica.db (NOT the machine's config.db)
+  state_db_path_env: OMEGA_STATE_DB_PATH     # omega's own cursors; separate from the projector's
+  flush_interval: 5s
+  snapshot_on_first_run: true                # ship what the projector has already accumulated
+
+  # Every table must be listed. An omitted table silently defaults to `rows`, which installs
+  # triggers on it and routes it to edge_state_* instead of the edge_ts_* hypertables.
+  #
+  # All of these are append-only and carry a fixed-width `event_ts`, so all are telemetry.
+  table_strategies:
+    # derived — what the dashboards read
+    cycles:              { strategy: telemetry, ts_column: event_ts }
+    step_dwells:         { strategy: telemetry, ts_column: event_ts }
+    step_actuators:      { strategy: telemetry, ts_column: event_ts }
+    state_durations:     { strategy: telemetry, ts_column: event_ts }
+    fault_events:        { strategy: telemetry, ts_column: event_ts }
+    door_events:         { strategy: telemetry, ts_column: event_ts }
+    actuator_intervals:  { strategy: telemetry, ts_column: event_ts }
+    cip_runs:            { strategy: telemetry, ts_column: event_ts }
+    # raw mirrors — drill-down
+    fsm_events:          { strategy: telemetry, ts_column: event_ts }
+    sensor_toggles:      { strategy: telemetry, ts_column: event_ts }
+    config_history:      { strategy: telemetry, ts_column: event_ts }
+    # rollups
+    hourly_rollups:      { strategy: telemetry, ts_column: event_ts }
+    hourly_fault_counts: { strategy: telemetry, ts_column: event_ts }
+    hourly_step_stats:   { strategy: telemetry, ts_column: event_ts }
+    daily_rollups:       { strategy: telemetry, ts_column: event_ts }
+    # collector health
+    projector_runs:      { strategy: telemetry, ts_column: event_ts }
+    gaps:                { strategy: telemetry, ts_column: event_ts }

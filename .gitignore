@@ -1,4 +1,13 @@
-# Runtime output — never commit machine data
+# Runtime databases — machine data, never committed
 *.db
 *.db-shm
 *.db-wal
+*.log
+
+# Device certificates are secrets
+omega/certs/*.crt
+omega/certs/*.key
+omega/certs/*.pem
+
+# Filled in per-device from omega-env.sh
+omega/omega.env
