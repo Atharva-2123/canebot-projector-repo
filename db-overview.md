@@ -139,6 +139,12 @@ Nearly 1:1 with the controller's `fsm_events`.
 >
 > The raw `sensors_json` stays in the replica for local inspection — it is what the bits are
 > checked against — it simply is not shipped.
+>
+> On upgrade the column is added by `ALTER TABLE`, which leaves existing rows NULL. Since
+> `sensors_json` is no longer replicated, those rows would otherwise reach the cloud carrying no
+> sensor state at all, so the projector backfills them once at startup from the JSON already in
+> the replica. Rows the agent has not yet shipped pick the bits up automatically; rows already
+> sent stay as they went. Measured at ~77k rows/sec, so a full replica is a matter of seconds.
 
 ### `sensor_toggles` — one row per sensor flip
 
