@@ -104,6 +104,17 @@ continuous and availability is computable. Full reference in [db-overview.md](db
 - Back both up alongside the replica. Losing them causes duplicate publishes.
 - All 17 tables are populated. `cip_runs` comes from Maintenance spans; the four rollups are
   aggregated from the replica's own finished tables once a bucket has closed.
+- **A table created empty and populated later is silently skipped by omega.** Reading zero rows
+  marks its snapshot done, and thereafter the cursor is fast-forwarded past everything that
+  arrives — no error, no log line. It bit all four rollups. Recovery is to stop omega, clear
+  that table's state, and restart:
+  ```bash
+  sqlite3 omega/state.db "
+  DELETE FROM meta WHERE key IN ('telemetry_snapshot_done:<t>','telemetry_src_rowid:<t>','telemetry_ts_raw:<t>');
+  UPDATE telemetry_seq SET cursor_ts=NULL, cursor_row_id=NULL WHERE source_table='<t>';"
+  ```
+  Only ever for a table that has genuinely shipped nothing — doing it to one that has resends
+  everything. Symptom: rows in the replica, table absent in the cloud, nothing in the log.
 - Nine columns are in the replica but deliberately not replicated — the sensor snapshots and
   actuator blobs on `step_dwells`, and `step_title` wherever it appears (the frontend derives
   it from `(state, step)`). `fsm_events` ships `sensors_bits`, a 32-character encoding of the
