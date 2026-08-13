@@ -77,7 +77,15 @@ sqlite-replication:
       ts_column: event_ts
       include_columns: [id, event_ts, raised_at_ms, cleared_at_ms, downtime_ms, order_key, fault_key, fault_type, severity, recovered, recovery_at_ms, state, step, message, dwell_seq_index, recipe_id, is_production, cycle_result, cycle_started_at_ms, hour_bucket_ms, date_utc]
     fsm_events:
-      strategy: telemetry
+      # ===== TEMPORARY: set back to `telemetry` once the small tables have landed =====
+      # flushTelemetry drains a table completely before returning (telemetry.go:106) and
+      # flushAll walks tables in sqlite_schema creation order, so fsm_events (table 9) would
+      # hold the pipe for ~10 hours and everything after it — sensor_toggles, config_history,
+      # all four rollups, projector_runs, gaps — would wait behind it.
+      # `ignore` is skipped by the strategy switch entirely. The cursor lives in omega's
+      # state.db keyed by table and is untouched, so re-enabling resumes exactly where this
+      # stopped: no re-snapshot, nothing re-sent.
+      strategy: ignore
       ts_column: event_ts
       # sensors_bits replaces sensors_json: the same 32 booleans as one character per input
       # (~34 B on the wire vs ~820, since it has no quotes to escape). Bit order is documented
@@ -117,7 +125,11 @@ sqlite-replication:
       ts_column: event_ts
       include_columns: [id, event_ts, step_started_at_ms, step_ended_at_ms, order_key, lane, state, step, seq_index, output_id, output_name, total_run_ms, segment_count, recipe_step, recipe_origin_state, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
     step_dwells:
-      strategy: telemetry
+      # ===== TEMPORARY: set back to `telemetry` once the small tables have landed =====
+      # Same reason as fsm_events above — this is table 2 in creation order and was holding
+      # the pipe for ~10 hours while 15 other tables sat behind it with a few thousand rows
+      # between them. Cursor is preserved; re-enabling resumes mid-backlog.
+      strategy: ignore
       ts_column: event_ts
       # Deliberately NOT shipped, though the replica keeps them all:
       #   sensors_start_json / sensors_end_json  ~820 B/row and identical on 99.7% of rows;
