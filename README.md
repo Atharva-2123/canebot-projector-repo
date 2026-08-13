@@ -102,8 +102,12 @@ continuous and availability is computable. Full reference in [db-overview.md](db
 - `projector_state.db` and `omega/state.db` are **separate on purpose**. Neither belongs in a
   sync policy; omega auto-enrols any table it finds in the database it is pointed at.
 - Back both up alongside the replica. Losing them causes duplicate publishes.
-- Five tables have no writer yet: `cip_runs`, `hourly_rollups`, `hourly_fault_counts`,
-  `hourly_step_stats`, `daily_rollups`.
+- All 17 tables are populated. `cip_runs` comes from Maintenance spans; the four rollups are
+  aggregated from the replica's own finished tables once a bucket has closed.
+- Nine columns are in the replica but deliberately not replicated — the sensor snapshots and
+  actuator blobs on `step_dwells`, and `step_title` wherever it appears (the frontend derives
+  it from `(state, step)`). `fsm_events` ships `sensors_bits`, a 32-character encoding of the
+  same booleans as `sensors_json`, instead of the JSON. See db-overview.md §9.
 - The omega binary is the **Go** omnibus build (36 MB). A slim client build is currently
   impossible because `sqlite-replication` is missing from omega's `modules/modulemap.go`,
   though it is present in `registry.go` — the two have drifted.

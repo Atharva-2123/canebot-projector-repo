@@ -57,15 +57,15 @@ The controller has 7–10 tables depending on which branch it runs.
 | `state_durations` | **derived** | `fsm_events` | yes |
 | `fault_events` | **derived** | `faults`, or `fsm_step_runs.fault_type` when that ledger is empty | yes |
 | `door_events` | **derived** | `sensor_input_toggles` (X0.0 + X0.7) | yes |
-| `cip_runs` | **derived** | `fsm_events` (Maintenance entry/exit) | **no writer yet** |
+| `cip_runs` | **derived** | Maintenance state spans | yes |
 | `fsm_events` | **raw mirror** | `fsm_events` | yes |
 | `sensor_toggles` | **raw mirror** | `sensor_input_toggles` | yes |
 | `config_history` | **raw-ish** | `config` (diffed — source has no history) | yes |
 | `actuator_intervals` | **raw mirror** | `actuator_output_intervals` | yes |
-| `hourly_rollups` | **rollup** | aggregates of the above | **no writer yet** |
-| `hourly_fault_counts` | **rollup** | aggregates of `fault_events` | **no writer yet** |
-| `hourly_step_stats` | **rollup** | aggregates of `step_dwells` | **no writer yet** |
-| `daily_rollups` | **rollup** | aggregates of the above | **no writer yet** |
+| `hourly_rollups` | **rollup** | aggregates of the above | yes |
+| `hourly_fault_counts` | **rollup** | aggregates of `fault_events` | yes |
+| `hourly_step_stats` | **rollup** | aggregates of `step_dwells` | yes |
+| `daily_rollups` | **rollup** | aggregates of the above | yes |
 | `projector_runs` | **health** | the projector itself | yes |
 | `gaps` | **health** | the projector itself | yes |
 
@@ -120,8 +120,25 @@ Nearly 1:1 with the controller's `fsm_events`.
 | `source` | **1:1** | Which firmware function emitted it |
 | `trace_id` | **1:1** | Correlation id, usually empty |
 | `payload_json` | **1:1** | Event-specific extra detail |
-| `sensors_json` | **1:1** | Snapshot of all 32 digital inputs at that instant |
+| `sensors_json` | **1:1** | Snapshot of all 32 digital inputs at that instant. **Local only — not replicated**, see `sensors_bits` |
+| `sensors_bits` | **computed** | The same 32 booleans as one `0`/`1` character each. This is the column that ships |
 | `is_production`, `hour_bucket_ms`, `date_utc` | added | See §4 |
+
+> **Why `sensors_bits` exists.** The firmware's snapshot is a JSON object keyed by input tag —
+> `{"X0.0":true,…}` — about 410 bytes, and roughly double that on the wire once escaped as a
+> string inside the replication payload. That is ~205 bytes per bit, and across ~700k events it
+> was the single largest thing in the pipeline. `sensors_bits` carries the identical
+> information in 32 characters with nothing to escape.
+>
+> **Bit order is the contract.** Bit *i* is the *i*-th input of `io.AllDigitalInputs()` sorted
+> numerically by `(byte, bit)` — `X0.0, X0.1, … X0.15, X1.0, …` — deliberately **not** the
+> lexicographic order of the tag strings, which would put `X0.10` before `X0.2`. A consumer
+> reproduces it by applying the same numeric sort to its own tag list; the fixed 32-character
+> width is what makes a mismatched list detectable instead of silently misaligned. An empty
+> string means *no snapshot was recorded*, which is not the same as every input reading low.
+>
+> The raw `sensors_json` stays in the replica for local inspection — it is what the bits are
+> checked against — it simply is not shipped.
 
 ### `sensor_toggles` — one row per sensor flip
 
@@ -320,25 +337,54 @@ Derived from two inputs in `sensor_input_toggles`:
 > reporting a duration would be fabrication. Resets with the door shut (Modbus resets, genuine
 > CIP bypass) do not invent an episode.
 
-### `cip_runs` — one row per clean-in-place run *(no writer yet)*
+### `cip_runs` — one row per clean-in-place run
+
+One row per closed **Maintenance** span. Maintenance *is* the CIP cycle in this firmware —
+`getMaintenanceStepMetadata` describes its steps as the CIP sequence — so a span in that state
+is a run.
 
 | Column | Meaning |
 |---|---|
 | `started_at_ms` / `ended_at_ms` | When the clean began and finished |
 | `duration_ms` | How long it took |
-| `completed` | 1 if it ran to completion, 0 if interrupted |
-| `trigger_source` | `auto` or `manual` |
+| `completed` | 1 if Maintenance step 7 was reached — the firmware labels it "CIP cycle complete" — 0 if the clean was interrupted |
+| `trigger_source` | **Always NULL.** The controller records no auto/manual distinction, and inventing one would be worse than an honest gap |
 | `fault_count` | Faults during the clean |
 
 > Replaces a KPI whose value currently **changes when you change the date range** — it counts
 > time buckets containing any CIP row, not actual runs.
+>
+> The completion marker is looked for in both `step_dwells` and `fsm_events`, for the same
+> reason AutoCycle step 19 is detected on both paths: a controller carrying `fsm_step_runs`
+> skips the dwell derivation from `fsm_events` entirely, so depending on the branch the step
+> appears in only one of the two.
 
 ---
 
-## 7. Rollups *(no writers yet)*
+## 7. Rollups
 
 Every column is additive — sums and counts, never a stored average — so hours re-aggregate
 correctly into days, weeks or months.
+
+Rollups are computed by a pass over the replica's **own finished tables**, not by the tracker.
+By the time a row is in `cycles` or `state_durations` it is settled, so aggregating from there
+is a query over facts rather than another "is it final yet" question. A bucket is written only
+once the timeline has moved past its end, so a rollup row is never revised — and the pass is
+bounded by the timeline, never wall-clock now, so a shutdown cannot stamp empty rollups on
+every hour since the last event.
+
+Two conventions worth knowing:
+
+- **`recipe_id` is always NULL.** These are machine-level rows. The time columns have no recipe
+  dimension, so splitting per recipe would duplicate them and break the partition property
+  below. Per-recipe figures come from `cycles`, which carries `recipe_id` and is replicated.
+- **`idle_ms` includes Manual.** `run`/`error`/`maintenance`/`idle` are meant to partition the
+  period, and Manual is neither production, fault, nor cleaning. Folding it into idle keeps the
+  partition complete rather than leaving a hole that makes availability look better than it was.
+
+State spans are **clipped to the bucket**, not attributed to the hour they started in — a
+three-hour idle stretch would otherwise put three hours into one bucket and nothing into the
+next two, and availability computed from that is wrong in both directions.
 
 ### `hourly_rollups` · `daily_rollups`
 
@@ -409,9 +455,18 @@ silently corrupts any availability figure.
 `door_events`, `actuator_intervals`, `fsm_events`, `sensor_toggles`, `config_history`,
 `projector_runs`, `gaps`.
 
-**No writer yet:** `cip_runs`, `hourly_rollups`, `hourly_fault_counts`, `hourly_step_stats`,
-`daily_rollups`. Schemas defined, tables created, nothing populates them — additive work that
-blocks nothing already running.
+**All 17 tables are populated.** `cip_runs` and the four rollups were schema-only for a while
+— created empty, with nothing inserting into them — and now have writers (`cmd/projector/rollup.go`).
+
+**Not everything in the replica is replicated.** Nine columns are deliberately held back
+because nothing reads them and they dominated the wire cost; the replica keeps them all:
+
+| Table | Not shipped | Why |
+|---|---|---|
+| `step_dwells` | `sensors_start_json`, `sensors_end_json` | ~820 B/row, and identical to each other on 99.7% of rows |
+| `step_dwells` | `sensors_trace_json`, `actuators_json` | empty on nearly every row; `step_actuators` carries the flattened form |
+| `step_dwells`, `step_actuators`, `fault_events`, `hourly_step_stats` | `step_title` | derived client-side from `(state, step)` |
+| `fsm_events` | `sensors_json` | superseded by `sensors_bits` |
 
 **Verification:** 24 tests passing, `PRAGMA foreign_key_check` clean, and the source
 database's hash is unchanged after every run.
