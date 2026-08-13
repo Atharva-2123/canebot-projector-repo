@@ -14,7 +14,14 @@ connection:
 modules:
   required: [sqlite-replication, heartbeat]
 security:
-  max_payload_bytes: 262144000
+  # 256 KiB. This is load-bearing, not a safety margin: fitTelemetryBatch reads
+  # maxTelemetryBatchRows (4096) rows and only binary-searches for a smaller chunk when the
+  # payload EXCEEDS this value. Set it high enough and no split ever happens, so omega hands
+  # the broker one publish carrying 4096 step_dwells rows and the connection is dropped
+  # ("use of closed network connection" / "publish was broken by timeout").
+  # Measured on the replica: worst-case single row is ~18 KB of JSON blobs, average ~5 bytes,
+  # so every row fits individually with room to spare.
+  max_payload_bytes: 262144
   capabilities:
     sqlite-replication: true
     heartbeat: true
