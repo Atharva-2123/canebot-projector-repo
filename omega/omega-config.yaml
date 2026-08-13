@@ -14,14 +14,23 @@ connection:
 modules:
   required: [sqlite-replication, heartbeat]
 security:
-  # 256 KiB. This is load-bearing, not a safety margin: fitTelemetryBatch reads
-  # maxTelemetryBatchRows (4096) rows and only binary-searches for a smaller chunk when the
-  # payload EXCEEDS this value. Set it high enough and no split ever happens, so omega hands
-  # the broker one publish carrying 4096 step_dwells rows and the connection is dropped
-  # ("use of closed network connection" / "publish was broken by timeout").
-  # Measured on the replica: worst-case single row is ~18 KB of JSON blobs, average ~5 bytes,
-  # so every row fits individually with room to spare.
-  max_payload_bytes: 262144
+  # 1 MiB. This value is load-bearing in both directions.
+  #
+  # Too high and nothing splits: fitTelemetryBatch reads maxTelemetryBatchRows (4096) rows and
+  # only binary-searches for a smaller chunk when the payload EXCEEDS this value. At 250 MB it
+  # never did, so omega handed the broker one publish carrying 4096 step_dwells rows — about
+  # 7 MB — and the connection was dropped ("use of closed network connection" / "publish was
+  # broken by timeout"), eventually killing the process.
+  #
+  # Too low and throughput suffers, because most of the ~20 s a batch takes is fixed overhead
+  # (round trip, ack, journal commit) rather than transfer: measured going from 151 to 427 rows
+  # per batch, 2.8x the payload cost only 1.3x the time. So batch size is close to free and the
+  # cap should sit as high as the broker tolerates.
+  #
+  # 1 MiB is ~1,750 rows at the current ~600 B/row — every row carries its column names, since
+  # the wire format is a per-row map (wire/payloads.go TelemetryRow.Fields) — which stays under
+  # the 4096-row cap and is 7x smaller than the payload that actually failed.
+  max_payload_bytes: 1048576
   capabilities:
     sqlite-replication: true
     heartbeat: true
