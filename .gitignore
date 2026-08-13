@@ -1,0 +1,4 @@
+# Runtime output — never commit machine data
+*.db
+*.db-shm
+*.db-wal

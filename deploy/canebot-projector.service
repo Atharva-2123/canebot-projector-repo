@@ -1,0 +1,35 @@
+[Unit]
+Description=CaneBot projector — reads the controller's SQLite read-only and writes the replica for edge sync
+Documentation=file:///opt/canebot/DEPLOY.md
+After=network.target
+
+[Service]
+Type=simple
+User=canebot
+Group=canebot
+
+# -source is the controller's database. Opened mode=ro; never written.
+# -replica is what the omega edge agent watches.
+# -state is our own bookkeeping and must NOT be added to any sync policy.
+ExecStart=/opt/canebot/projector \
+  -source /path/to/config.db \
+  -replica /var/lib/canebot/canebot_replica.db \
+  -state /var/lib/canebot/projector_state.db \
+  -interval 5s \
+  -retention 336h
+
+Restart=always
+RestartSec=10s
+
+# The projector needs to read the controller's database and write only its own directory.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/canebot
+PrivateTmp=true
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=canebot-projector
+
+[Install]
+WantedBy=multi-user.target
