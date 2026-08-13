@@ -40,7 +40,7 @@ The controller has 7–10 tables depending on which branch it runs.
 | `actuator_output_intervals` | all | Mirrored to `actuator_intervals` (closed rows only) |
 | `sensor_input_toggles` | all | Mirrored to `sensor_toggles`, and derived into `door_events` |
 | `config` | all | Diffed into `config_history` |
-| `fsm_step_runs` | `test/tracking_fsm` | Becomes `step_dwells` + `step_actuators` when present |
+| `fsm_step_runs` | `test/tracking_fsm` | Becomes `step_dwells` + `step_actuators` when present. Its `fault_type`/`fault_message` also drive `fault_events` and each cycle's `result` when `faults` is empty |
 | `fsm_resume_state` | all | **Not replicated** — operational state, single overwritten row |
 | `Audit` | tracking_fsm, maintenance | **Not replicated** — only mirrors `faults` and `orders`, already covered |
 | `order_checkpoint` | `test/maintenance` | **Not replicated** — single overwritten power-loss resume row |
@@ -55,7 +55,7 @@ The controller has 7–10 tables depending on which branch it runs.
 | `step_dwells` | **derived** | `fsm_step_runs`, or `fsm_events` as fallback | yes |
 | `step_actuators` | **derived** | `fsm_step_runs.actuators_json` | yes |
 | `state_durations` | **derived** | `fsm_events` | yes |
-| `fault_events` | **derived** | `faults` | yes |
+| `fault_events` | **derived** | `faults`, or `fsm_step_runs.fault_type` when that ledger is empty | yes |
 | `door_events` | **derived** | `sensor_input_toggles` (X0.0 + X0.7) | yes |
 | `cip_runs` | **derived** | `fsm_events` (Maintenance entry/exit) | **no writer yet** |
 | `fsm_events` | **raw mirror** | `fsm_events` | yes |
@@ -232,6 +232,7 @@ From `fsm_step_runs` when the firmware provides it, otherwise paired from `fsm_e
 | `sensors_trace_json` | **Every** input edge during the step, verbatim from the firmware |
 | `actuators_json` | Full per-output actuator breakdown, verbatim. `step_actuators` flattens this but keeps only the first segment's `recipe_step`, so the raw blob is what preserves multi-pulse detail |
 | `source_kind` | `step_runs` if the firmware reported the step, `derived` if we paired it. Keeps a mixed-firmware fleet interpretable |
+| `fault_type`, `fault_message` | The fault that interrupted this step *(firmware-sourced rows only)*. The firmware attaches it before the transition to Error, so it lands on the step that actually failed rather than the Error dwell that follows — which is what makes "which step fails most" answerable without a join |
 | `cycle_started_at_ms` | The parent cycle's start, so "how far into the drink" needs no join |
 
 ### `step_actuators` — motor run time within one step
@@ -265,6 +266,16 @@ Paired from consecutive `fsm_events`. Consecutive spells in the same state are m
 ### `fault_events` — one row per fault
 
 From `faults`, emitted exactly once with a stable id.
+
+> **Two sources, one row.** The controller in the field records `fsm_step_runs` but writes no
+> `faults` rows at all, so this table would be empty on it and every fault-terminated cycle
+> would resolve to `aborted` via the duration cap — indistinguishable from an operator walking
+> away. `fsm_step_runs.fault_type`/`fault_message` are therefore projected into `fault_events`
+> too, stamped at the dwell's end (the step ended *because* of the fault). `faults` stays
+> authoritative — it can record several faults inside one `Error` dwell, which a single pair of
+> columns cannot — so when both carry the same fault type within the same dwell, the ledger
+> wins and the step run's copy is dropped rather than double-counted. Step-run-sourced rows are
+> recognisable by a `fault_key` of the form `<type>|sr<step_run_id>|<order_key>`.
 
 | Column | Meaning |
 |---|---|
