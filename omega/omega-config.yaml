@@ -27,10 +27,15 @@ security:
   # per batch, 2.8x the payload cost only 1.3x the time. So batch size is close to free and the
   # cap should sit as high as the broker tolerates.
   #
-  # 1 MiB is ~1,750 rows at the current ~600 B/row — every row carries its column names, since
-  # the wire format is a per-row map (wire/payloads.go TelemetryRow.Fields) — which stays under
-  # the 4096-row cap and is 7x smaller than the payload that actually failed.
-  max_payload_bytes: 1048576
+  # The broker's ceiling sits between these two, measured rather than assumed:
+  #   262144 (256 KiB)  ~427 rows/batch, publishes cleanly
+  #   1048576 (1 MiB)   rejected — "use of closed network connection", same as the 7 MB case
+  # So 256 KiB it is. Anything above it needs a broker-side limit change, not a config edit;
+  # 512 KiB is untested and would be the next probe if that throughput is ever worth a restart.
+  #
+  # At ~600 B/row — every row carries its column names, since the wire format is a per-row map
+  # (wire/payloads.go TelemetryRow.Fields) — this is ~427 rows per batch, ~20 rows/sec.
+  max_payload_bytes: 262144
   capabilities:
     sqlite-replication: true
     heartbeat: true
