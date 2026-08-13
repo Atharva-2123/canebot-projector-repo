@@ -58,6 +58,18 @@ If the controller's database is not at `~/CaneBot_FSM_go/config.db`:
 SOURCE_DB=/actual/path/config.db sudo -E ./linux/install-services.sh
 ```
 
+## Checking the omega config
+
+Neither connects nor opens a database, so it is safe to run any time:
+
+```bash
+./omega/omega --validate --client ./omega/omega-config.yaml
+```
+
+It reports unknown modules and missing capability grants. It does **not** validate the
+`sqlite-replication` section — `source_db_path` can be missing entirely and it still passes —
+so a green result says nothing about the table list or column names.
+
 ## Day to day
 
 ```bash
@@ -92,6 +104,13 @@ continuous and availability is computable. Full reference in [db-overview.md](db
 - Back both up alongside the replica. Losing them causes duplicate publishes.
 - Five tables have no writer yet: `cip_runs`, `hourly_rollups`, `hourly_fault_counts`,
   `hourly_step_stats`, `daily_rollups`.
-- The omega binary is the omnibus build (36 MB). A slim client build is currently impossible
-  because `sqlite-replication` is missing from omega's `modules/modulemap.go`, though it is
-  present in `registry.go` — the two have drifted.
+- The omega binary is the **Go** omnibus build (36 MB). A slim client build is currently
+  impossible because `sqlite-replication` is missing from omega's `modules/modulemap.go`,
+  though it is present in `registry.go` — the two have drifted.
+- The Rust agent (`Projects/omega-rs`, `main`) is a drop-in alternative: it registers
+  `sqlite-replication` directly in `omega-agent/src/main.rs`, publishes the same
+  `sync/telemetry/batch` topics, and validates this same config file unchanged. It has to be
+  built on the device (`cargo build --release -p omega-agent`) because `rusqlite` is `bundled`
+  and `rustls` uses `ring`, which need a full C cross-toolchain from macOS.
+- The unit passes `--client` with two dashes. Go's `flag` accepts both forms; the Rust agent
+  rejects `-client` outright, so the two-dash form is the one that works either way.

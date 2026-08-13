@@ -1,71 +1,97 @@
-# omega client config for CaneBot.
-#
-# omega reads the projector's output and replicates it to ilyama over MQTT. It does NOT read
-# the machine's own database — the projector does that, read-only, and writes canebot_replica.db.
-#
-#   config.db ──ro──▶ projector ──▶ canebot_replica.db ──▶ omega ──▶ ilyama
-#
-# Run:  ./omega-linux-arm64 -client canebot.yaml
-
-name: canebot
-description: CaneBot — replicate the projector's output to ilyama
-platform: linux
-
+name: "CaneBot Vending Machine 1"
 connection:
   transport: mqtt
-  server_url_env: OMEGA_MQTT_BROKER_URL   # from the device's MQTT connection details
-  device_id_env: OMEGA_DEVICE_ID          # the device NAME as registered, not its UUID
-  root_topic_env: OMEGA_ROOT_TOPIC        # {topic_slug}/{device_name}
+  server_url: "ssl://mqtt.ilyama.golain.io:8883"
+  device_id: "CaneBot Vending Machine 1"
+  root_topic: "/6541_b195/CaneBot Vending Machine 1"
   mqtt:
     keep_alive: 30s
-    # false is required: with a clean session the broker cannot buffer downlink
-    # pause/resume control messages while the device is offline.
     clean_session: false
     tls:
-      ca_cert_path_env: OMEGA_TLS_CA_PATH
-      client_cert_path_env: OMEGA_TLS_CERT_PATH
-      client_key_path_env: OMEGA_TLS_KEY_PATH
-
+      ca_cert_path: /home/pi/projector/canebot-projector-repo/omega/certs/ca.crt
+      client_cert_path: /home/pi/projector/canebot-projector-repo/omega/certs/device.crt
+      client_key_path: /home/pi/projector/canebot-projector-repo/omega/certs/device.key
 modules:
-  required:
-    - sqlite-replication
-    - heartbeat
-
+  required: [sqlite-replication, heartbeat]
 security:
-  max_payload_bytes: 262144
+  max_payload_bytes: 262144000
   capabilities:
     sqlite-replication: true
     heartbeat: true
-
 sqlite-replication:
-  source_db_path_env: OMEGA_SOURCE_DB_PATH   # -> canebot_replica.db (NOT the machine's config.db)
-  state_db_path_env: OMEGA_STATE_DB_PATH     # omega's own cursors; separate from the projector's
+  # The PROJECTOR'S OUTPUT, never the machine's own config.db — omega must not open the
+  # controller's database. Matches -replica in linux/install-services.sh.
+  source_db_path: /home/pi/projector/canebot-projector-repo/projector/canebot_replica.db
+  # omega's own cursors, separate from the projector's projector_state.db.
+  state_db_path: /home/pi/projector/canebot-projector-repo/omega/state.db
   flush_interval: 5s
-  snapshot_on_first_run: true                # ship what the projector has already accumulated
-
-  # Every table must be listed. An omitted table silently defaults to `rows`, which installs
-  # triggers on it and routes it to edge_state_* instead of the edge_ts_* hypertables.
-  #
-  # All of these are append-only and carry a fixed-width `event_ts`, so all are telemetry.
+  snapshot_on_first_run: true
   table_strategies:
-    # derived — what the dashboards read
-    cycles:              { strategy: telemetry, ts_column: event_ts }
-    step_dwells:         { strategy: telemetry, ts_column: event_ts }
-    step_actuators:      { strategy: telemetry, ts_column: event_ts }
-    state_durations:     { strategy: telemetry, ts_column: event_ts }
-    fault_events:        { strategy: telemetry, ts_column: event_ts }
-    door_events:         { strategy: telemetry, ts_column: event_ts }
-    actuator_intervals:  { strategy: telemetry, ts_column: event_ts }
-    cip_runs:            { strategy: telemetry, ts_column: event_ts }
-    # raw mirrors — drill-down
-    fsm_events:          { strategy: telemetry, ts_column: event_ts }
-    sensor_toggles:      { strategy: telemetry, ts_column: event_ts }
-    config_history:      { strategy: telemetry, ts_column: event_ts }
-    # rollups
-    hourly_rollups:      { strategy: telemetry, ts_column: event_ts }
-    hourly_fault_counts: { strategy: telemetry, ts_column: event_ts }
-    hourly_step_stats:   { strategy: telemetry, ts_column: event_ts }
-    daily_rollups:       { strategy: telemetry, ts_column: event_ts }
-    # collector health
-    projector_runs:      { strategy: telemetry, ts_column: event_ts }
-    gaps:                { strategy: telemetry, ts_column: event_ts }
+    actuator_intervals:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, src_id, revision, output_id, output_name, started_state, started_step, started_send_ok, ended_state, ended_step, ended_send_ok, fault_type, fault_message, fault_raised_at_ms, fault_cleared_at_ms, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+    cip_runs:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, completed, trigger_source, fault_count, hour_bucket_ms, date_utc]
+    config_history:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, changed_at_ms, order_key, config_key, old_value, new_value, hour_bucket_ms, date_utc]
+    cycles:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, is_production, result, recipe_id, glass_count, terminal_state, terminal_step, fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms, fsm_event_count, step_event_count, state_transition_count, unique_state_count, hour_bucket_ms, date_utc]
+    daily_rollups:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, date_utc, recipe_id, glasses, orders_completed, orders_faulted, fault_count, cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms]
+    door_events:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, opened_at_ms, closed_at_ms, duration_ms, order_key, fault_reset_during, fault_reset_count, first_reset_at_ms, last_reset_at_ms, ms_to_first_reset, state_at_open, step_at_open, state_at_close, step_at_close, opened_in_error, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+    fault_events:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, raised_at_ms, cleared_at_ms, downtime_ms, order_key, fault_key, fault_type, severity, recovered, recovery_at_ms, state, step, step_title, message, dwell_seq_index, recipe_id, is_production, cycle_result, cycle_started_at_ms, hour_bucket_ms, date_utc]
+    fsm_events:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, event_at_ms, order_key, src_id, event_kind, state_from, state_to, current_state, step_from, step_to, modbus_order_reg, input_id, input_value, event_type, source, trace_id, payload_json, sensors_json, is_production, hour_bucket_ms, date_utc]
+    gaps:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, reason]
+    hourly_fault_counts:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, bucket_start_ms, date_utc, fault_type, severity, occurrences, downtime_ms_sum]
+    hourly_rollups:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, bucket_start_ms, date_utc, recipe_id, glasses, orders_started, orders_completed, orders_faulted, fault_count, cip_runs, cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms]
+    hourly_step_stats:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, bucket_start_ms, date_utc, lane, state, step, step_title, dwell_count, duration_ms_sum, duration_ms_max]
+    projector_runs:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, stopped_at_ms, version, source_branch, note]
+    sensor_toggles:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, event_at_ms, order_key, src_id, input_id, input_name, value_from, value_to, current_state, current_step, is_production, hour_bucket_ms, date_utc]
+    state_durations:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, entered_at_ms, exited_at_ms, duration_ms, order_key, state, entry_reason, exit_reason, is_downtime, is_production, hour_bucket_ms, date_utc]
+    step_actuators:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, step_started_at_ms, step_ended_at_ms, order_key, lane, state, step, step_title, seq_index, output_id, output_name, total_run_ms, segment_count, recipe_step, recipe_origin_state, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+    step_dwells:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, lane, state, step, step_title, seq_index, previous_state, previous_step, event_count, io_event_count, transition_count, fault_count, sensors_start_json, sensors_end_json, sensors_trace_json, actuators_json, source_kind, fault_type, fault_message, recipe_id, is_production, cycle_result, cycle_started_at_ms, hour_bucket_ms, date_utc]
