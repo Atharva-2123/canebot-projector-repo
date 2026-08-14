@@ -11,3 +11,12 @@ omega/certs/*.pem
 
 # Filled in per-device from omega-env.sh
 omega/omega.env
+
+# The projector is built from source on the machine — `make projector`.
+# Committing it made every rebuild a new multi-megabyte blob in git history.
+projector/projector
+
+# Developer-local module path override, when the CaneBot_FSM_go checkout is not
+# a sibling of this repo. go.mod carries the layout the machine actually uses.
+go.work
+go.work.sum

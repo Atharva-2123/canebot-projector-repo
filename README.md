@@ -13,8 +13,18 @@ unchanged after every projector run.
 ## Layout
 
 ```
+cmd/projector/              the source — built with `make projector`
+  main.go                   orchestration: collect, derive, flush
+  reader.go                 read-only access to the controller's config.db
+  tracker.go                the derivation: intervals, dwells, faults, synthetic keys
+  writer.go                 replica writes and column migrations
+  schema.go                 the DDL for both databases
+  rollup.go                 hourly and daily aggregates
+  sensors.go                sensor snapshot -> sensors_bits
+  state.go                  read cursors and watermarks
+
 projector/
-  projector                 the binary
+  projector                 the binary — built, not committed      (gitignored)
   canebot_replica.db        output — what omega replicates      (runtime, gitignored)
   projector_state.db        read cursors and watermarks         (runtime, gitignored)
 
@@ -32,11 +42,39 @@ linux/
 db-overview.md              every table and column, and where each comes from
 ```
 
+## Build
+
+The projector is built from source on the machine that runs it. The binary is no longer
+committed — a rebuild used to add a fresh multi-megabyte blob to git history every time.
+
+It needs **Go >= 1.25.5** and the controller's source tree **as a sibling directory**:
+
+```
+canebot-projector-repo/
+CaneBot_FSM_go/
+```
+
+That is not incidental. The projector imports the controller's own step metadata
+(`fsm.GetStepDescription`) and IO pin definitions (`io.InputMainDoorSwitch` = X0.0,
+`io.InputCIPBypassSwitch` = X0.7) so that step titles and sensor bit order come from
+firmware rather than a second copy that drifts from it. If the sibling is missing, `make`
+stops and tells you.
+
+```bash
+make projector      # -> projector/projector
+make test
+make vet
+```
+
+If your checkout is laid out differently, either adjust the `replace` directive in
+`go.mod`, or create a local `go.work` (gitignored) pointing at the real path.
+
 ## Install
 
 ```bash
 git clone https://github.com/Atharva-2123/canebot-projector-repo.git
 cd canebot-projector-repo
+make projector
 
 # 1. projector — safe to start immediately, it only reads
 sudo ./linux/install-services.sh

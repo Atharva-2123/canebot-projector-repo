@@ -1,0 +1,528 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+)
+
+// cip_runs and the four rollup tables are produced by a pass over the replica's OWN finished
+// tables, not by the tracker.
+//
+// That is deliberate. The tracker is a state machine over machine time and holds work open
+// until it can be closed; threading hour-bucket counters through it would mean every counter
+// carries the same "is it final yet" question the intervals already answer. By the time a row
+// is in `cycles` or `state_durations` it is finished and immutable, so aggregating from there
+// is a plain query over settled facts.
+//
+// Everything here obeys the same emit-once rule as the rest of the pipeline: a bucket is only
+// written after the timeline has moved past its end, so a row is never revised. Rollup columns
+// are sums and counts, never a stored average, which is what lets hours re-aggregate into days
+// and weeks without recomputing from source.
+
+const (
+	hourMS = int64(time.Hour / time.Millisecond)
+	dayMS  = 24 * hourMS
+
+	// The firmware's own completion marker for the CIP cycle: Maintenance step 7 is labelled
+	// "CIP cycle complete - reset maintenance timer and glass count" (fsm/step_metadata.go).
+	// Same role as AutoCycle step 19 for a drink.
+	cipCompleteStep = 7
+)
+
+// emitDerived writes everything that can be derived from already-flushed rows. upToMS is the
+// furthest point on the timeline actually processed — never wall-clock now, which would sit
+// ahead of the data and finalise buckets we have not filled yet.
+func (p *projector) emitDerived(ctx context.Context, upToMS int64) error {
+	if upToMS <= 0 {
+		return nil
+	}
+	// CIP runs first: hourly_rollups counts them.
+	if err := p.emitCIPRuns(ctx, upToMS); err != nil {
+		return err
+	}
+	if err := p.emitHourly(ctx, upToMS); err != nil {
+		return err
+	}
+	return p.emitDaily(ctx, upToMS)
+}
+
+// ---------------------------------------------------------------------------
+// cip_runs
+// ---------------------------------------------------------------------------
+
+// emitCIPRuns turns each closed Maintenance span into one CIP run.
+//
+// Maintenance IS the CIP cycle in this firmware — getMaintenanceStepMetadata describes the
+// Maintenance steps as the CIP sequence — so a span in that state is a run, and reaching step 7
+// within it is the firmware saying the run completed rather than being interrupted.
+//
+// This replaces a dashboard KPI whose value changes when you change the date range, because it
+// counts time buckets containing any CIP row rather than actual runs.
+func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
+	_, last, err := p.st.Cursor("cip_runs")
+	if err != nil {
+		return err
+	}
+
+	rows, err := p.rep.db.QueryContext(ctx,
+		`SELECT entered_at_ms, exited_at_ms, order_key
+		   FROM state_durations
+		  WHERE state = 'Maintenance' AND exited_at_ms > ? AND exited_at_ms <= ?
+		  ORDER BY exited_at_ms`, last, upToMS)
+	if err != nil {
+		return fmt.Errorf("read maintenance spans: %w", err)
+	}
+	type span struct {
+		started, ended int64
+		orderKey       string
+	}
+	var spans []span
+	for rows.Next() {
+		var s span
+		if err := rows.Scan(&s.started, &s.ended, &s.orderKey); err != nil {
+			rows.Close()
+			return err
+		}
+		spans = append(spans, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	high := last
+	for _, s := range spans {
+		// Look for the completion marker on both paths, for the same reason AutoCycle step 19
+		// is detected in both ApplyFSMEvent and ApplyStepRun: a controller carrying
+		// fsm_step_runs skips the dwell derivation from fsm_events entirely, so on one branch
+		// the step appears only as a dwell and on the other only as an event.
+		var completed int64
+		if err := p.rep.db.QueryRowContext(ctx,
+			`SELECT EXISTS(
+			   SELECT 1 FROM step_dwells
+			    WHERE state = 'Maintenance' AND step = ?
+			      AND started_at_ms >= ? AND started_at_ms < ?
+			   UNION ALL
+			   SELECT 1 FROM fsm_events
+			    WHERE current_state = 'Maintenance' AND step_to = ?
+			      AND event_at_ms >= ? AND event_at_ms < ?)`,
+			cipCompleteStep, s.started, s.ended,
+			cipCompleteStep, s.started, s.ended).Scan(&completed); err != nil {
+			return fmt.Errorf("cip completion probe: %w", err)
+		}
+
+		var faultCount int64
+		if err := p.rep.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM fault_events WHERE raised_at_ms >= ? AND raised_at_ms < ?`,
+			s.started, s.ended).Scan(&faultCount); err != nil {
+			return fmt.Errorf("cip fault count: %w", err)
+		}
+
+		ts, err := p.rep.guard("cip_runs", s.ended)
+		if err != nil {
+			return err
+		}
+		// trigger_source is left NULL on purpose. The controller records no distinction
+		// between an automatic clean (the maintenance counter reaching MaintenanceCount) and
+		// one an operator started, and inventing a value would be worse than an honest gap.
+		if _, err := p.rep.db.ExecContext(ctx,
+			`INSERT INTO cip_runs (event_ts, started_at_ms, ended_at_ms, duration_ms, order_key,
+			                       completed, trigger_source, fault_count, hour_bucket_ms, date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			ts, s.started, s.ended, s.ended-s.started, s.orderKey,
+			completed, nil, faultCount, hourBucket(s.started), dateUTC(s.started),
+		); err != nil {
+			return fmt.Errorf("insert cip_run: %w", err)
+		}
+		p.rep.st.SetWatermark("cip_runs", ts)
+		high = s.ended
+	}
+
+	if high == last {
+		return nil
+	}
+	return p.st.SetCursor("cip_runs", 0, high)
+}
+
+// ---------------------------------------------------------------------------
+// Hourly
+// ---------------------------------------------------------------------------
+
+func (p *projector) emitHourly(ctx context.Context, upToMS int64) error {
+	_, last, err := p.st.Cursor("hourly_rollups")
+	if err != nil {
+		return err
+	}
+
+	next := last + hourMS
+	if last == 0 {
+		earliest, ok, err := p.earliestBucket(ctx)
+		if err != nil || !ok {
+			return err
+		}
+		next = earliest
+	}
+
+	for b := next; b+hourMS <= upToMS; b += hourMS {
+		if err := p.emitHourBucket(ctx, b); err != nil {
+			return err
+		}
+		if err := p.st.SetCursor("hourly_rollups", 0, b); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// earliestBucket finds the first hour any finished row falls in, so a first run does not have
+// to guess where history starts.
+func (p *projector) earliestBucket(ctx context.Context) (int64, bool, error) {
+	var v sql.NullInt64
+	err := p.rep.db.QueryRowContext(ctx,
+		`SELECT MIN(b) FROM (
+		   SELECT MIN(hour_bucket_ms) b FROM cycles
+		   UNION ALL SELECT MIN(hour_bucket_ms) FROM state_durations
+		   UNION ALL SELECT MIN(hour_bucket_ms) FROM fault_events
+		   UNION ALL SELECT MIN(hour_bucket_ms) FROM step_dwells)`).Scan(&v)
+	if err != nil {
+		return 0, false, fmt.Errorf("earliest bucket: %w", err)
+	}
+	if !v.Valid {
+		return 0, false, nil
+	}
+	return v.Int64, true, nil
+}
+
+func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error {
+	bucketEnd := bucketStart + hourMS
+
+	agg, err := p.aggregateCycles(ctx, "hour_bucket_ms = ?", bucketStart)
+	if err != nil {
+		return err
+	}
+	occupancy, err := p.stateOccupancy(ctx, bucketStart, bucketEnd)
+	if err != nil {
+		return err
+	}
+
+	var faultCount, cipCount int64
+	if err := p.rep.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM fault_events WHERE hour_bucket_ms = ?`, bucketStart).
+		Scan(&faultCount); err != nil {
+		return err
+	}
+	if err := p.rep.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM cip_runs WHERE hour_bucket_ms = ?`, bucketStart).
+		Scan(&cipCount); err != nil {
+		return err
+	}
+
+	ts, err := p.rep.guard("hourly_rollups", bucketEnd)
+	if err != nil {
+		return err
+	}
+	// recipe_id is NULL: this is the machine-level row. The time columns have no recipe
+	// dimension, so splitting the row per recipe would duplicate them and break the property
+	// that run/error/maintenance/idle sum to the period. Per-recipe figures come from `cycles`,
+	// which carries recipe_id and is replicated.
+	if _, err := p.rep.db.ExecContext(ctx,
+		`INSERT INTO hourly_rollups (event_ts, bucket_start_ms, date_utc, recipe_id,
+		                             glasses, orders_started, orders_completed, orders_faulted,
+		                             fault_count, cip_runs, cycle_ms_sum, cycle_count,
+		                             run_ms, error_ms, maintenance_ms, idle_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		ts, bucketStart, dateUTC(bucketStart), nil,
+		agg.glasses, agg.started, agg.completed, agg.faulted,
+		faultCount, cipCount, agg.cycleMS, agg.cycleCount,
+		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,
+	); err != nil {
+		return fmt.Errorf("insert hourly_rollup: %w", err)
+	}
+	p.rep.st.SetWatermark("hourly_rollups", ts)
+
+	if err := p.emitHourlyFaultCounts(ctx, bucketStart, ts); err != nil {
+		return err
+	}
+	return p.emitHourlyStepStats(ctx, bucketStart, ts)
+}
+
+func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64, ts string) error {
+	// Read fully before writing. The replica is capped at one connection, so an INSERT issued
+	// while this result set is still open waits for a connection that only closing it frees.
+	type row struct {
+		faultType, severity   string
+		occurrences, downtime int64
+	}
+	var out []row
+
+	rows, err := p.rep.db.QueryContext(ctx,
+		`SELECT fault_type, severity, COUNT(*), COALESCE(SUM(downtime_ms), 0)
+		   FROM fault_events
+		  WHERE hour_bucket_ms = ?
+		  GROUP BY fault_type, severity
+		  ORDER BY fault_type, severity`, bucketStart)
+	if err != nil {
+		return fmt.Errorf("hourly fault counts: %w", err)
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.faultType, &r.severity, &r.occurrences, &r.downtime); err != nil {
+			rows.Close()
+			return err
+		}
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, r := range out {
+		if _, err := p.rep.db.ExecContext(ctx,
+			`INSERT INTO hourly_fault_counts (event_ts, bucket_start_ms, date_utc,
+			                                  fault_type, severity, occurrences, downtime_ms_sum)
+			 VALUES (?,?,?,?,?,?,?)`,
+			ts, bucketStart, dateUTC(bucketStart), r.faultType, r.severity, r.occurrences, r.downtime,
+		); err != nil {
+			return fmt.Errorf("insert hourly_fault_count: %w", err)
+		}
+	}
+	if len(out) > 0 {
+		p.rep.st.SetWatermark("hourly_fault_counts", ts)
+	}
+	return nil
+}
+
+func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, ts string) error {
+	// duration_ms_max is carried alongside the sum because an average hides the outlier that
+	// is usually the thing worth looking at.
+	// Same single-connection rule as emitHourlyFaultCounts: drain the query before inserting.
+	type row struct {
+		lane, state    string
+		step           sql.NullInt64
+		count, sum, ms int64
+	}
+	var out []row
+
+	rows, err := p.rep.db.QueryContext(ctx,
+		`SELECT lane, state, step, COUNT(*), COALESCE(SUM(duration_ms), 0), COALESCE(MAX(duration_ms), 0)
+		   FROM step_dwells
+		  WHERE hour_bucket_ms = ?
+		  GROUP BY lane, state, step
+		  ORDER BY lane, state, step`, bucketStart)
+	if err != nil {
+		return fmt.Errorf("hourly step stats: %w", err)
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.lane, &r.state, &r.step, &r.count, &r.sum, &r.ms); err != nil {
+			rows.Close()
+			return err
+		}
+		out = append(out, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, r := range out {
+		var stepPtr *int64
+		var title any
+		if r.step.Valid {
+			v := r.step.Int64
+			stepPtr = &v
+			title = nullIfEmpty(stepTitle(r.state, &v))
+		}
+		if _, err := p.rep.db.ExecContext(ctx,
+			`INSERT INTO hourly_step_stats (event_ts, bucket_start_ms, date_utc,
+			                                lane, state, step, step_title,
+			                                dwell_count, duration_ms_sum, duration_ms_max)
+			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			ts, bucketStart, dateUTC(bucketStart), r.lane, r.state, stepPtr, title,
+			r.count, r.sum, r.ms,
+		); err != nil {
+			return fmt.Errorf("insert hourly_step_stat: %w", err)
+		}
+	}
+	if len(out) > 0 {
+		p.rep.st.SetWatermark("hourly_step_stats", ts)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Daily
+// ---------------------------------------------------------------------------
+
+func (p *projector) emitDaily(ctx context.Context, upToMS int64) error {
+	_, last, err := p.st.Cursor("daily_rollups")
+	if err != nil {
+		return err
+	}
+
+	next := last + dayMS
+	if last == 0 {
+		earliest, ok, err := p.earliestBucket(ctx)
+		if err != nil || !ok {
+			return err
+		}
+		next = earliest - (earliest % dayMS)
+	}
+
+	for d := next; d+dayMS <= upToMS; d += dayMS {
+		if err := p.emitDayBucket(ctx, d); err != nil {
+			return err
+		}
+		if err := p.st.SetCursor("daily_rollups", 0, d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
+	dayEnd := dayStart + dayMS
+	date := dateUTC(dayStart)
+
+	agg, err := p.aggregateCycles(ctx, "date_utc = ?", date)
+	if err != nil {
+		return err
+	}
+	occupancy, err := p.stateOccupancy(ctx, dayStart, dayEnd)
+	if err != nil {
+		return err
+	}
+
+	var faultCount int64
+	if err := p.rep.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM fault_events WHERE date_utc = ?`, date).Scan(&faultCount); err != nil {
+		return err
+	}
+
+	ts, err := p.rep.guard("daily_rollups", dayEnd)
+	if err != nil {
+		return err
+	}
+	if _, err := p.rep.db.ExecContext(ctx,
+		`INSERT INTO daily_rollups (event_ts, date_utc, recipe_id, glasses,
+		                            orders_completed, orders_faulted, fault_count,
+		                            cycle_ms_sum, cycle_count,
+		                            run_ms, error_ms, maintenance_ms, idle_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		ts, date, nil, agg.glasses,
+		agg.completed, agg.faulted, faultCount,
+		agg.cycleMS, agg.cycleCount,
+		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,
+	); err != nil {
+		return fmt.Errorf("insert daily_rollup: %w", err)
+	}
+	p.rep.st.SetWatermark("daily_rollups", ts)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Shared aggregation
+// ---------------------------------------------------------------------------
+
+type cycleAgg struct {
+	glasses    int64
+	started    int64
+	completed  int64
+	faulted    int64
+	cycleMS    int64
+	cycleCount int64
+}
+
+// aggregateCycles counts production cycles in one bucket. Synthetic intervals (idle,
+// maintenance, manual, error) are excluded from every figure here — they are machine time,
+// not orders, and their duration is accounted for by stateOccupancy instead.
+func (p *projector) aggregateCycles(ctx context.Context, whereCol string, arg any) (cycleAgg, error) {
+	var a cycleAgg
+	err := p.rep.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT COALESCE(SUM(CASE WHEN result = ? THEN COALESCE(glass_count, 0) ELSE 0 END), 0),
+		       COUNT(*),
+		       COALESCE(SUM(result = ?), 0),
+		       COALESCE(SUM(result IN (?, ?)), 0),
+		       COALESCE(SUM(duration_ms), 0),
+		       COUNT(*)
+		  FROM cycles
+		 WHERE is_production = 1 AND %s`, whereCol),
+		resultCompleted, resultCompleted,
+		resultFaultedRecoverable, resultFaultedNonRecoverable, arg,
+	).Scan(&a.glasses, &a.started, &a.completed, &a.faulted, &a.cycleMS, &a.cycleCount)
+	if err != nil {
+		return a, fmt.Errorf("aggregate cycles: %w", err)
+	}
+	return a, nil
+}
+
+type stateOccupancy struct {
+	run         int64
+	errored     int64
+	maintenance int64
+	idle        int64
+}
+
+// stateOccupancy sums how long the machine held each state within [bucketStart, bucketEnd),
+// clipping spans to the bucket.
+//
+// The clipping is what makes the four columns sum to the period. Attributing a whole span to
+// the hour it started in is cheaper, but a three-hour idle stretch would then put 3 hours into
+// one bucket and nothing into the next two — and availability computed from that is wrong in
+// both directions.
+//
+// Manual counts as idle. The four columns are meant to partition the period, and Manual is
+// neither production, fault, nor cleaning — folding it in keeps the partition complete rather
+// than leaving a silent hole that makes availability look better than it was.
+func (p *projector) stateOccupancy(ctx context.Context, bucketStart, bucketEnd int64) (stateOccupancy, error) {
+	var o stateOccupancy
+	rows, err := p.rep.db.QueryContext(ctx,
+		`SELECT state, entered_at_ms, exited_at_ms
+		   FROM state_durations
+		  WHERE exited_at_ms > ? AND entered_at_ms < ?`, bucketStart, bucketEnd)
+	if err != nil {
+		return o, fmt.Errorf("state occupancy: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var state string
+		var entered, exited int64
+		if err := rows.Scan(&state, &entered, &exited); err != nil {
+			return o, err
+		}
+		ms := overlapMS(entered, exited, bucketStart, bucketEnd)
+		if ms <= 0 {
+			continue
+		}
+		switch state {
+		case "AutoCycle":
+			o.run += ms
+		case "Error":
+			o.errored += ms
+		case "Maintenance":
+			o.maintenance += ms
+		default: // HomeIdle, Manual, and anything the firmware adds later
+			o.idle += ms
+		}
+	}
+	return o, rows.Err()
+}
+
+// overlapMS is the length of the intersection of [s,e) and [bs,be).
+func overlapMS(s, e, bs, be int64) int64 {
+	lo, hi := s, e
+	if bs > lo {
+		lo = bs
+	}
+	if be < hi {
+		hi = be
+	}
+	if hi <= lo {
+		return 0
+	}
+	return hi - lo
+}
