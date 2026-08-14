@@ -200,19 +200,19 @@ func TestCompletedCycleIsEmittedOnce(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-aaa111'`); got != 1 {
+	if got := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_id='ORD-aaa111'`); got != 1 {
 		t.Fatalf("cycles rows = %d, want 1", got)
 	}
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key='ORD-aaa111'`); got != resultCompleted {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id='ORD-aaa111'`); got != resultCompleted {
 		t.Errorf("result = %q, want %q", got, resultCompleted)
 	}
-	if got := scalarInt(t, rep, `SELECT is_production FROM cycles WHERE order_key='ORD-aaa111'`); got != 1 {
+	if got := scalarInt(t, rep, `SELECT is_production FROM cycles WHERE order_id='ORD-aaa111'`); got != 1 {
 		t.Errorf("is_production = %d, want 1", got)
 	}
-	if got := scalarInt(t, rep, `SELECT recipe_id FROM cycles WHERE order_key='ORD-aaa111'`); got != 3 {
+	if got := scalarInt(t, rep, `SELECT recipe_id FROM cycles WHERE order_id='ORD-aaa111'`); got != 3 {
 		t.Errorf("recipe_id = %d, want 3", got)
 	}
-	if got := scalarInt(t, rep, `SELECT duration_ms FROM cycles WHERE order_key='ORD-aaa111'`); got <= 0 {
+	if got := scalarInt(t, rep, `SELECT duration_ms FROM cycles WHERE order_id='ORD-aaa111'`); got <= 0 {
 		t.Errorf("duration_ms = %d, want > 0", got)
 	}
 }
@@ -228,13 +228,13 @@ func TestFaultedCycleIsMarkedFaulted(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey); got != resultFaultedNonRecoverable {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey); got != resultFaultedNonRecoverable {
 		t.Errorf("result = %q, want %q", got, resultFaultedNonRecoverable)
 	}
-	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_id=?`, orderKey); n != 1 {
 		t.Errorf("fault_count = %d, want 1", n)
 	}
-	if sev := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_key=?`, orderKey); sev != severityNonRecoverable {
+	if sev := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_id=?`, orderKey); sev != severityNonRecoverable {
 		t.Errorf("severity = %q, want %q", sev, severityNonRecoverable)
 	}
 }
@@ -249,7 +249,7 @@ func TestRecoverableFaultIsClassifiedSeparately(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey); got != resultFaultedRecoverable {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey); got != resultFaultedRecoverable {
 		t.Errorf("result = %q, want %q", got, resultFaultedRecoverable)
 	}
 }
@@ -266,7 +266,7 @@ func TestInFlightCycleIsMarkedAborted(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key='ORD-ccc333'`)
+	got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id='ORD-ccc333'`)
 	if got != resultAborted {
 		t.Errorf("result = %q, want %q — an unfinished cycle must not read as completed", got, resultAborted)
 	}
@@ -326,7 +326,7 @@ func TestEventTSNeverGoesBackwards(t *testing.T) {
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	const wantWidth = len("2026-08-11T10:00:00.000000000Z")
-	for _, table := range []string{"cycles", "fsm_events", "step_dwells", "state_durations"} {
+	for _, table := range []string{"cycles", "step_dwells", "state_durations"} {
 		rows, err := rep.Query(fmt.Sprintf(`SELECT event_ts FROM %s ORDER BY id`, table))
 		if err != nil {
 			t.Fatalf("query %s: %v", table, err)
@@ -383,14 +383,16 @@ func TestNoOrphanRows(t *testing.T) {
 		t.Fatal("foreign_key_check reported violations: rows exist with no parent cycle")
 	}
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fsm_events WHERE current_state='Maintenance'`); n == 0 {
-		t.Error("maintenance events were dropped; out-of-cycle activity must still be captured")
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM state_durations WHERE state='Maintenance'`); n == 0 {
+		t.Error("maintenance spans were dropped; out-of-cycle activity must still be captured")
 	}
 	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE is_production=0`); n == 0 {
 		t.Error("no synthetic interval was created for out-of-cycle activity")
 	}
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fsm_events WHERE order_key IS NULL OR order_key=''`); n != 0 {
-		t.Errorf("%d fsm_events rows have no order_key; every row must be scopeable", n)
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM state_durations WHERE order_id IS NULL OR order_id=''`); n != 0 {
+		t.Errorf("%d state_durations rows have no order_id; every row must be scopeable", n)
 	}
 }
 
@@ -410,11 +412,19 @@ func TestReRunIsIdempotent(t *testing.T) {
 	}
 
 	rep := openRO(t, replica)
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-ggg777'`); n != 1 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_id='ORD-ggg777'`); n != 1 {
 		t.Errorf("cycles rows = %d after 3 runs, want 1", n)
 	}
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fsm_events`); n != autoCycleCompleteStep {
-		t.Errorf("fsm_events rows = %d after 3 runs, want %d", n, autoCycleCompleteStep)
+	// Nothing anywhere may be duplicated, not just the parent cycle. order_id is unique on
+	// cycles and is the join key for every child, so a duplicate there is the failure that
+	// would corrupt everything downstream.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM (SELECT order_id FROM cycles GROUP BY order_id HAVING COUNT(*) > 1)`,
+	); n != 0 {
+		t.Errorf("%d order_ids appear more than once in cycles after 3 runs", n)
+	}
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM state_durations`); n == 0 {
+		t.Error("no state spans written; three runs should still produce the children")
 	}
 }
 
@@ -503,7 +513,7 @@ func TestParallelLanesAreSeparated(t *testing.T) {
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	for _, lane := range []string{laneMain, laneTilter, laneCrusher} {
-		if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_key=? AND lane=?`, orderKey, lane); n == 0 {
+		if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND lane=?`, orderKey, lane); n == 0 {
 			t.Errorf("lane %q produced no dwells", lane)
 		}
 	}
@@ -512,7 +522,7 @@ func TestParallelLanesAreSeparated(t *testing.T) {
 	// without comparing timestamp strings.
 	dupes := scalarInt(t, rep, `
 		SELECT COUNT(*) FROM (
-			SELECT lane, seq_index FROM step_dwells WHERE order_key=?
+			SELECT lane, seq_index FROM step_dwells WHERE order_id=?
 			GROUP BY lane, seq_index HAVING COUNT(*) > 1)`, orderKey)
 	if dupes != 0 {
 		t.Errorf("found %d duplicated (lane, seq_index) pairs", dupes)
@@ -533,7 +543,7 @@ func TestStepDwellsAreClosedAtNextDwellStart(t *testing.T) {
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	got := scalarInt(t, rep,
-		`SELECT duration_ms FROM step_dwells WHERE order_key=? AND lane=? AND step=1`, orderKey, laneMain)
+		`SELECT duration_ms FROM step_dwells WHERE order_id=? AND lane=? AND step=1`, orderKey, laneMain)
 	if got != 3000 {
 		t.Errorf("step 1 duration = %dms, want 3000 (closed at the next dwell's start)", got)
 	}
@@ -624,32 +634,30 @@ func TestStepRunsAreIngested(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_id=?`, orderKey); n != 1 {
 		t.Fatalf("step_dwells rows = %d, want 1", n)
 	}
-	if k := scalarStr(t, rep, `SELECT source_kind FROM step_dwells WHERE order_key=?`, orderKey); k != sourceKindStepRuns {
+	if k := scalarStr(t, rep, `SELECT source_kind FROM step_dwells WHERE order_id=?`, orderKey); k != sourceKindStepRuns {
 		t.Errorf("source_kind = %q, want %q", k, sourceKindStepRuns)
 	}
-	if d := scalarInt(t, rep, `SELECT duration_ms FROM step_dwells WHERE order_key=?`, orderKey); d != 3000 {
+	if d := scalarInt(t, rep, `SELECT duration_ms FROM step_dwells WHERE order_id=?`, orderKey); d != 3000 {
 		t.Errorf("duration_ms = %d, want 3000", d)
 	}
-	if ps := scalarStr(t, rep, `SELECT previous_state FROM step_dwells WHERE order_key=?`, orderKey); ps != "AutoCycle" {
+	if ps := scalarStr(t, rep, `SELECT previous_state FROM step_dwells WHERE order_id=?`, orderKey); ps != "AutoCycle" {
 		t.Errorf("previous_state = %q, want AutoCycle", ps)
 	}
 	// Sensor snapshots only exist on this path.
-	if s := scalarStr(t, rep, `SELECT sensors_start_json FROM step_dwells WHERE order_key=?`, orderKey); s == "" {
+	if s := scalarStr(t, rep, `SELECT sensors_start_json FROM step_dwells WHERE order_id=?`, orderKey); s == "" {
 		t.Error("sensors_start_json is empty; step-run rows carry boundary snapshots")
 	}
 
-	// And the per-step actuator rollup, which cannot be derived from fsm_events at all.
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_actuators WHERE order_key=?`, orderKey); n != 1 {
-		t.Fatalf("step_actuators rows = %d, want 1", n)
+	// step_actuators is no longer a table: per-output totals are a GROUP BY over
+	// actuator_intervals, which holds every pulse. The dwell still records that the step ran.
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_id=?`, orderKey); n != 1 {
+		t.Fatalf("step_dwells rows = %d, want 1", n)
 	}
-	if ms := scalarInt(t, rep, `SELECT total_run_ms FROM step_actuators WHERE order_key=?`, orderKey); ms != 2500 {
-		t.Errorf("total_run_ms = %d, want 2500", ms)
-	}
-	if rs := scalarInt(t, rep, `SELECT recipe_step FROM step_actuators WHERE order_key=?`, orderKey); rs != 11 {
-		t.Errorf("recipe_step = %d, want 11", rs)
+	if s := scalarStr(t, rep, `SELECT actuators_json FROM step_dwells WHERE order_id=?`, orderKey); s == "" {
+		t.Errorf("actuators_json is empty; the step run's per-output detail must survive")
 	}
 }
 
@@ -666,16 +674,24 @@ func TestFallbackDerivesDwellsWithoutStepRuns(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_key=?`, orderKey); n == 0 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_dwells WHERE order_id=?`, orderKey); n == 0 {
 		t.Fatal("no dwells derived; the fallback must still work without fsm_step_runs")
 	}
 	if k := scalarStr(t, rep,
-		`SELECT source_kind FROM step_dwells WHERE order_key=? LIMIT 1`, orderKey); k != sourceKindDerived {
+		`SELECT source_kind FROM step_dwells WHERE order_id=? LIMIT 1`, orderKey); k != sourceKindDerived {
 		t.Errorf("source_kind = %q, want %q", k, sourceKindDerived)
 	}
-	// step_actuators is unavailable on this path — the source has no per-step attribution.
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_actuators`); n != 0 {
-		t.Errorf("step_actuators = %d rows, want 0 without fsm_step_runs", n)
+	// Per-step actuator attribution is unavailable on this path: it comes from
+	// fsm_step_runs.actuators_json, which this branch does not have. A derived dwell carries
+	// no actuator detail at all rather than an empty-looking rollup.
+	var acts sql.NullString
+	if err := rep.QueryRow(
+		`SELECT actuators_json FROM step_dwells WHERE order_id=? LIMIT 1`, orderKey,
+	).Scan(&acts); err != nil {
+		t.Fatalf("read actuators_json: %v", err)
+	}
+	if acts.Valid && acts.String != "" {
+		t.Errorf("actuators_json = %q, want none without fsm_step_runs", acts.String)
 	}
 }
 
@@ -695,29 +711,29 @@ func TestChildRowsCarryCycleContext(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	for _, table := range []string{"step_dwells", "fsm_events"} {
+	for _, table := range []string{"step_dwells", "fault_events"} {
 		q := fmt.Sprintf(`SELECT COUNT(*) FROM %s
-		                  WHERE order_key=? AND (hour_bucket_ms IS NULL OR date_utc IS NULL
-		                                         OR is_production IS NULL)`, table)
+		                  WHERE order_id=? AND (date_utc IS NULL OR is_production IS NULL
+		                                         OR bucket_5m_ms IS NULL)`, table)
 		if n := scalarInt(t, rep, q, orderKey); n != 0 {
 			t.Errorf("%s: %d rows missing denormalized columns", table, n)
 		}
 	}
 
 	if r := scalarInt(t, rep,
-		`SELECT recipe_id FROM step_dwells WHERE order_key=? LIMIT 1`, orderKey); r != 6 {
+		`SELECT recipe_id FROM step_dwells WHERE order_id=? LIMIT 1`, orderKey); r != 6 {
 		t.Errorf("step_dwells.recipe_id = %d, want 6 (copied from the parent cycle)", r)
 	}
 	if cr := scalarStr(t, rep,
-		`SELECT cycle_result FROM step_dwells WHERE order_key=? LIMIT 1`, orderKey); cr != resultCompleted {
+		`SELECT cycle_result FROM step_dwells WHERE order_id=? LIMIT 1`, orderKey); cr != resultCompleted {
 		t.Errorf("step_dwells.cycle_result = %q, want %q", cr, resultCompleted)
 	}
-	if d := scalarStr(t, rep, `SELECT date_utc FROM cycles WHERE order_key=?`, orderKey); d != "2026-08-11" {
+	if d := scalarStr(t, rep, `SELECT date_utc FROM cycles WHERE order_id=?`, orderKey); d != "2026-08-11" {
 		t.Errorf("date_utc = %q, want 2026-08-11", d)
 	}
-	// The bucket must floor to the hour, not merely copy the timestamp.
-	if b := scalarInt(t, rep, `SELECT hour_bucket_ms FROM cycles WHERE order_key=?`, orderKey); b%3600000 != 0 {
-		t.Errorf("hour_bucket_ms = %d is not floored to an hour", b)
+	// A bucket key must floor to its width, not merely copy the timestamp.
+	if b := scalarInt(t, rep, `SELECT bucket_15m_ms FROM cycles WHERE order_id=?`, orderKey); b%900000 != 0 {
+		t.Errorf("bucket_15m_ms = %d is not floored to 15 minutes", b)
 	}
 }
 
@@ -764,18 +780,14 @@ func TestStepRunRawBlobsArePreserved(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarStr(t, rep, `SELECT sensors_trace_json FROM step_dwells WHERE order_key=?`, orderKey); got != trace {
-		t.Errorf("sensors_trace_json not preserved verbatim:\n got %q\nwant %q", got, trace)
-	}
-	if got := scalarStr(t, rep, `SELECT actuators_json FROM step_dwells WHERE order_key=?`, orderKey); got != acts {
+	if got := scalarStr(t, rep, `SELECT actuators_json FROM step_dwells WHERE order_id=?`, orderKey); got != acts {
 		t.Errorf("actuators_json not preserved verbatim:\n got %q\nwant %q", got, acts)
 	}
-	// The flattened row still exists, and still reports the total across both pulses.
-	if n := scalarInt(t, rep, `SELECT total_run_ms FROM step_actuators WHERE order_key=?`, orderKey); n != 9000 {
-		t.Errorf("step_actuators.total_run_ms = %d, want 9000", n)
-	}
-	if n := scalarInt(t, rep, `SELECT segment_count FROM step_actuators WHERE order_key=?`, orderKey); n != 2 {
-		t.Errorf("segment_count = %d, want 2", n)
+	// step_actuators is no longer a table — per-output totals are a GROUP BY over
+	// actuator_intervals — but the step run's own breakdown is still carried verbatim, so the
+	// totals remain recoverable from the blob.
+	if !strings.Contains(acts, "9000") && !strings.Contains(acts, "4500") {
+		t.Errorf("actuators_json lost the per-pulse durations: %q", acts)
 	}
 }
 
@@ -988,19 +1000,13 @@ func TestActuatorsJSONIsAMap(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM step_actuators WHERE order_key=?`, orderKey); n != 2 {
-		t.Fatalf("step_actuators rows = %d, want 2 (one per output in the map)", n)
-	}
-	// The map key is the output_id — information that would be lost decoding as an array.
-	if id := scalarStr(t, rep,
-		`SELECT output_id FROM step_actuators WHERE order_key=? AND output_name='Crusher Motor'`,
-		orderKey); id != "Y0.1" {
-		t.Errorf("output_id = %q, want Y0.1 (taken from the map key)", id)
-	}
-	if ms := scalarInt(t, rep,
-		`SELECT total_run_ms FROM step_actuators WHERE order_key=? AND output_id='Y0.3'`,
-		orderKey); ms != 1500 {
-		t.Errorf("total_run_ms = %d, want 1500", ms)
+	// The blob is kept verbatim on the dwell; the map key is the output_id, which is
+	// information an array decode would lose.
+	got := scalarStr(t, rep, `SELECT actuators_json FROM step_dwells WHERE order_id=?`, orderKey)
+	for _, want := range []string{`"Y0.1"`, `"Y0.3"`, "Crusher Motor", "1500"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("actuators_json is missing %s; decoding as an array would lose the key", want)
+		}
 	}
 }
 
@@ -1014,7 +1020,7 @@ func TestCycleCompletesFromStepRunsAlone(t *testing.T) {
 	sourcePath, db := newSourceDB(t)
 	const orderKey = "ORD-sr9001"
 
-	// No orders row, no fsm_events, no faults — only step runs carrying an order_key.
+	// No orders row, no fsm_events, no faults — only step runs carrying an order_id.
 	for i := 1; i < autoCycleCompleteStep; i++ {
 		start := base.Add(time.Duration(i) * 2 * time.Second)
 		seedStepRun(t, db, orderKey, "AutoCycle", i, start, start.Add(2*time.Second), "AutoCycle", nil, "")
@@ -1025,14 +1031,14 @@ func TestCycleCompletesFromStepRunsAlone(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey)
+	got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey)
 	if got != resultCompleted {
 		t.Errorf("result = %q, want %q — step 19 is the firmware's own completion marker", got, resultCompleted)
 	}
-	if p := scalarInt(t, rep, `SELECT is_production FROM cycles WHERE order_key=?`, orderKey); p != 1 {
+	if p := scalarInt(t, rep, `SELECT is_production FROM cycles WHERE order_id=?`, orderKey); p != 1 {
 		t.Errorf("is_production = %d, want 1 — an order-keyed step run is production work", p)
 	}
-	if d := scalarInt(t, rep, `SELECT duration_ms FROM cycles WHERE order_key=?`, orderKey); d <= 0 {
+	if d := scalarInt(t, rep, `SELECT duration_ms FROM cycles WHERE order_id=?`, orderKey); d <= 0 {
 		t.Errorf("duration_ms = %d, want > 0", d)
 	}
 }
@@ -1061,40 +1067,40 @@ func TestFaultFromStepRunsAlone(t *testing.T) {
 
 	// CrusherMotorFault is on the non-recoverable list, so the cycle must say so rather than
 	// fall through to the duration cap's `aborted`.
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey); got != resultFaultedNonRecoverable {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey); got != resultFaultedNonRecoverable {
 		t.Errorf("result = %q, want %q", got, resultFaultedNonRecoverable)
 	}
-	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_id=?`, orderKey); n != 1 {
 		t.Errorf("cycles.fault_count = %d, want 1", n)
 	}
-	if got := scalarStr(t, rep, `SELECT dominant_fault_type FROM cycles WHERE order_key=?`, orderKey); got != "CrusherMotorFault" {
+	if got := scalarStr(t, rep, `SELECT dominant_fault_type FROM cycles WHERE order_id=?`, orderKey); got != "CrusherMotorFault" {
 		t.Errorf("dominant_fault_type = %q, want CrusherMotorFault", got)
 	}
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fault_events WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fault_events WHERE order_id=?`, orderKey); n != 1 {
 		t.Fatalf("fault_events rows = %d, want 1", n)
 	}
-	if got := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_key=?`, orderKey); got != severityNonRecoverable {
+	if got := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_id=?`, orderKey); got != severityNonRecoverable {
 		t.Errorf("severity = %q, want %q", got, severityNonRecoverable)
 	}
 	// The fault must land on the step it interrupted, which is what makes "which step fails
 	// most" answerable — the firmware attaches it before the Error transition for this reason.
-	if got := scalarInt(t, rep, `SELECT step FROM fault_events WHERE order_key=?`, orderKey); got != 10 {
+	if got := scalarInt(t, rep, `SELECT step FROM fault_events WHERE order_id=?`, orderKey); got != 10 {
 		t.Errorf("fault_events.step = %d, want 10", got)
 	}
-	if got := scalarStr(t, rep, `SELECT message FROM fault_events WHERE order_key=?`, orderKey); got != "Fault detected on X0.4" {
+	if got := scalarStr(t, rep, `SELECT message FROM fault_events WHERE order_id=?`, orderKey); got != "Fault detected on X0.4" {
 		t.Errorf("message = %q", got)
 	}
 	if got := scalarStr(t, rep,
-		`SELECT fault_type FROM step_dwells WHERE order_key=? AND step=10`, orderKey); got != "CrusherMotorFault" {
+		`SELECT fault_type FROM step_dwells WHERE order_id=? AND step=10`, orderKey); got != "CrusherMotorFault" {
 		t.Errorf("step_dwells.fault_type = %q, want CrusherMotorFault", got)
 	}
 	if n := scalarInt(t, rep,
-		`SELECT fault_count FROM step_dwells WHERE order_key=? AND step=10`, orderKey); n != 1 {
+		`SELECT fault_count FROM step_dwells WHERE order_id=? AND step=10`, orderKey); n != 1 {
 		t.Errorf("step_dwells.fault_count = %d, want 1", n)
 	}
 	// Steps that ran clean must stay clean.
 	if n := scalarInt(t, rep,
-		`SELECT COUNT(*) FROM step_dwells WHERE order_key=? AND fault_type IS NOT NULL`, orderKey); n != 1 {
+		`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND fault_type IS NOT NULL`, orderKey); n != 1 {
 		t.Errorf("%d dwells carry a fault, want exactly 1", n)
 	}
 }
@@ -1114,10 +1120,10 @@ func TestRecoverableFaultFromStepRunIsClassified(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey); got != resultFaultedRecoverable {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey); got != resultFaultedRecoverable {
 		t.Errorf("result = %q, want %q", got, resultFaultedRecoverable)
 	}
-	if got := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_key=?`, orderKey); got != severityRecoverable {
+	if got := scalarStr(t, rep, `SELECT severity FROM fault_events WHERE order_id=?`, orderKey); got != severityRecoverable {
 		t.Errorf("severity = %q, want %q", got, severityRecoverable)
 	}
 }
@@ -1141,16 +1147,16 @@ func TestLedgerFaultIsNotDoubleCountedByStepRun(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fault_events WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM fault_events WHERE order_id=?`, orderKey); n != 1 {
 		t.Errorf("fault_events rows = %d, want 1 — the ledger row and the step run's copy are one fault", n)
 	}
-	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_key=?`, orderKey); n != 1 {
+	if n := scalarInt(t, rep, `SELECT fault_count FROM cycles WHERE order_id=?`, orderKey); n != 1 {
 		t.Errorf("cycles.fault_count = %d, want 1", n)
 	}
 	// The denormalised columns still ride along on the dwell — they are the join-free view,
 	// and suppressing them would lose the step attribution the ledger row does not carry.
 	if got := scalarStr(t, rep,
-		`SELECT fault_type FROM step_dwells WHERE order_key=? AND step=10`, orderKey); got != "CrusherMotorFault" {
+		`SELECT fault_type FROM step_dwells WHERE order_id=? AND step=10`, orderKey); got != "CrusherMotorFault" {
 		t.Errorf("step_dwells.fault_type = %q, want CrusherMotorFault", got)
 	}
 }
@@ -1187,11 +1193,11 @@ func TestOldControllerWithoutFaultColumnsStillProjects(t *testing.T) {
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
-	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_key=?`, orderKey); got != resultCompleted {
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, orderKey); got != resultCompleted {
 		t.Errorf("result = %q, want %q — the old schema must still project", got, resultCompleted)
 	}
 	if n := scalarInt(t, rep,
-		`SELECT COUNT(*) FROM step_dwells WHERE order_key=? AND fault_type IS NOT NULL`, orderKey); n != 0 {
+		`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND fault_type IS NOT NULL`, orderKey); n != 0 {
 		t.Errorf("%d dwells carry a fault_type, want 0 — the source has no such column", n)
 	}
 }
@@ -1302,25 +1308,32 @@ func TestSensorBitsEmptyIsNotAllZeroes(t *testing.T) {
 	}
 }
 
-// TestFSMEventCarriesSensorBits is the end-to-end check: a seeded snapshot must reach the
-// replica as a decodable bit string.
-func TestFSMEventCarriesSensorBits(t *testing.T) {
+// TestSnapshotReachesTheReplicaAsBits is the end-to-end check: a seeded snapshot must reach
+// the replica as a decodable bit string.
+//
+// It travels on step_dwells now. fsm_events carried the only copy until this schema stopped
+// replicating that table, which is exactly why the snapshot moved onto the dwell.
+func TestSnapshotReachesTheReplicaAsBits(t *testing.T) {
 	sourcePath, db := newSourceDB(t)
 	const orderKey = "ORD-bits01"
 
 	seedOrder(t, db, orderKey, 2, base)
 	mustExec(t, db,
-		`INSERT INTO fsm_events (ts_utc, event_kind, current_state, step_from, step_to,
-		                         order_key, sensors_json)
-		 VALUES (?,?,?,?,?,?,?)`,
-		srcTime(base.Add(time.Second)), "input_changed", "AutoCycle", 1, 1, orderKey,
-		`{"X0.0":true,"X0.1":false,"X1.5":true}`)
-	seedStep(t, db, orderKey, "AutoCycle", 1, autoCycleCompleteStep, base.Add(2*time.Second))
+		`INSERT INTO fsm_step_runs (step_started_ts_utc, step_ended_ts_utc, current_state, step,
+		                            previous_state, previous_step, order_key,
+		                            sensors_snapshot_start_json, sensors_snapshot_end_json,
+		                            sensors_trace_json, actuators_json)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		srcTime(base.Add(time.Second)), srcTime(base.Add(2*time.Second)), "AutoCycle", 1,
+		nil, nil, orderKey,
+		`{"X0.0":true,"X0.1":false,"X1.5":true}`, `{"X0.0":true}`, `[]`, `{}`)
+	seedStep(t, db, orderKey, "AutoCycle", 1, autoCycleCompleteStep, base.Add(3*time.Second))
 
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	bits := scalarStr(t, rep,
-		`SELECT sensors_bits FROM fsm_events WHERE order_key=? AND sensors_bits IS NOT NULL LIMIT 1`, orderKey)
+		`SELECT sensors_start_bits FROM step_dwells
+		  WHERE order_id=? AND sensors_start_bits IS NOT NULL LIMIT 1`, orderKey)
 	if len(bits) != 32 {
 		t.Fatalf("sensors_bits = %q (len %d), want width 32", bits, len(bits))
 	}
@@ -1337,11 +1350,13 @@ func TestFSMEventCarriesSensorBits(t *testing.T) {
 	if bits[idx["X0.1"]] != '0' {
 		t.Errorf("X0.1 should be clear: %q", bits)
 	}
-	// The raw JSON must still be in the replica — it is what the bits are checked against.
+	// The raw JSON stays in the replica for local inspection, even though it is held back
+	// from replication — it is what the bits can be checked against on the machine itself.
 	if raw := scalarStr(t, rep,
-		`SELECT sensors_json FROM fsm_events WHERE order_key=? AND sensors_json IS NOT NULL LIMIT 1`,
+		`SELECT sensors_start_json FROM step_dwells
+		  WHERE order_id=? AND sensors_start_json IS NOT NULL LIMIT 1`,
 		orderKey); raw == "" {
-		t.Error("sensors_json should remain in the replica for local inspection")
+		t.Error("sensors_start_json should remain in the replica for local inspection")
 	}
 }
 
@@ -1384,9 +1399,12 @@ func TestCIPRunEmittedFromMaintenanceSpan(t *testing.T) {
 	if d := scalarInt(t, rep, `SELECT duration_ms FROM cip_runs`); d <= 0 {
 		t.Errorf("duration_ms = %d, want > 0", d)
 	}
-	// trigger_source is deliberately NULL: the controller records no auto/manual distinction.
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cip_runs WHERE trigger_source IS NULL`); n != 1 {
-		t.Error("trigger_source should be NULL rather than a guessed value")
+	// There is no trigger_source column. It could only ever have been NULL — the controller
+	// records no auto/manual distinction — and a column that can never hold a value looks
+	// queryable without being so.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM pragma_table_info('cip_runs') WHERE name='trigger_source'`); n != 0 {
+		t.Error("trigger_source is back; it can never hold a value")
 	}
 }
 
@@ -1515,105 +1533,6 @@ func TestRollupsAreNotDuplicatedOnRerun(t *testing.T) {
 	}
 }
 
-// TestSensorBitsBackfill covers the upgrade path on a live replica: ALTER TABLE ADD COLUMN
-// leaves existing rows NULL, and since sensors_json is no longer replicated those rows would
-// otherwise reach the cloud with no sensor state at all.
-func TestSensorBitsBackfill(t *testing.T) {
-	dir := t.TempDir()
-	replicaPath := filepath.Join(dir, "canebot_replica.db")
-	statePath := filepath.Join(dir, "projector_state.db")
-
-	st, err := openState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rep, err := openReplica(replicaPath, st)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// fsm_events.order_key is a FK to cycles, so the parent interval has to exist first.
-	if _, err := rep.db.Exec(
-		`INSERT INTO cycles (event_ts, started_at_ms, ended_at_ms, duration_ms, order_key,
-		                     is_production, result, hour_bucket_ms, date_utc)
-		 VALUES ('2026-08-13T00:00:00.000000000Z',0,1,1,'IDLE-x',0,'idle',0,'2026-08-13')`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Rows as an older build left them: snapshot present, bits never computed. One row has an
-	// unparseable snapshot, which must not stall the walk.
-	seedRow := func(id int64, ts, sensors string) {
-		if _, err := rep.db.Exec(
-			`INSERT INTO fsm_events (id, event_ts, event_at_ms, order_key, src_id, event_kind,
-			                         sensors_json, sensors_bits, is_production, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,NULL,0,0,'2026-08-13')`,
-			id, ts, id, "IDLE-x", id, "input_changed", sensors); err != nil {
-			t.Fatal(err)
-		}
-	}
-	seedRow(1, "2026-08-13T00:00:00.000000001Z", `{"X0.0":true,"X1.5":true}`)
-	seedRow(2, "2026-08-13T00:00:00.000000002Z", `{"X0.0":false}`)
-	seedRow(3, "2026-08-13T00:00:00.000000003Z", `not json at all`)
-	rep.Close()
-	st.Close()
-
-	// Reopening runs the backfill.
-	st2, err := openState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st2.Close()
-	rep2, err := openReplica(replicaPath, st2)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer rep2.Close()
-
-	var bits1, bits2 string
-	if err := rep2.db.QueryRow(`SELECT sensors_bits FROM fsm_events WHERE id=1`).Scan(&bits1); err != nil {
-		t.Fatal(err)
-	}
-	if err := rep2.db.QueryRow(`SELECT sensors_bits FROM fsm_events WHERE id=2`).Scan(&bits2); err != nil {
-		t.Fatal(err)
-	}
-	if len(bits1) != 32 || len(bits2) != 32 {
-		t.Fatalf("backfilled widths: %q (%d), %q (%d)", bits1, len(bits1), bits2, len(bits2))
-	}
-	idx := map[string]int{}
-	for i, tag := range sensorBitOrder {
-		idx[tag] = i
-	}
-	if bits1[idx["X0.0"]] != '1' || bits1[idx["X1.5"]] != '1' {
-		t.Errorf("row 1 bits = %q, want X0.0 and X1.5 set", bits1)
-	}
-	if strings.Count(bits2, "1") != 0 {
-		t.Errorf("row 2 bits = %q, want all clear", bits2)
-	}
-	// The unparseable row stays NULL — and must not be revisited, which is what the id-based
-	// walk guarantees. Reaching this line at all means the loop terminated.
-	var bad sql.NullString
-	if err := rep2.db.QueryRow(`SELECT sensors_bits FROM fsm_events WHERE id=3`).Scan(&bad); err != nil {
-		t.Fatal(err)
-	}
-	if bad.Valid {
-		t.Errorf("unparseable snapshot became %q, want NULL", bad.String)
-	}
-
-	// Already-filled rows must not be rewritten on the next start.
-	if _, err := rep2.db.Exec(`UPDATE fsm_events SET sensors_bits = 'SENTINEL' WHERE id = 1`); err != nil {
-		t.Fatal(err)
-	}
-	if err := backfillSensorBits(rep2.db); err != nil {
-		t.Fatal(err)
-	}
-	var after string
-	if err := rep2.db.QueryRow(`SELECT sensors_bits FROM fsm_events WHERE id=1`).Scan(&after); err != nil {
-		t.Fatal(err)
-	}
-	if after != "SENTINEL" {
-		t.Errorf("backfill rewrote an already-filled row: %q", after)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Late-arriving orders row
@@ -1626,7 +1545,7 @@ func TestSensorBitsBackfill(t *testing.T) {
 //
 // When that happens the cycle is written from the events alone, with recipe_id and
 // glass_count null. The orders row then arrives, ApplyOrder reopens the interval, and the
-// insert hits ON CONFLICT(order_key) DO NOTHING — so the recipe is dropped on the floor
+// insert hits ON CONFLICT(order_id) DO NOTHING — so the recipe is dropped on the floor
 // and never recoverable, because cycles is immutable after the first write.
 //
 // This is the shape of the production symptom: recipe_id and glass_count null on every
@@ -1650,13 +1569,13 @@ func TestRecipeArrivesAfterTheCycleWasWritten(t *testing.T) {
 
 	rep := openRO(t, replica)
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-late01'`); n != 1 {
-		t.Fatalf("cycles rows = %d, want exactly 1 (order_key is unique)", n)
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_id='ORD-late01'`); n != 1 {
+		t.Fatalf("cycles rows = %d, want exactly 1 (order_id is unique)", n)
 	}
 
 	var recipe, glass sql.NullInt64
 	err := rep.QueryRow(
-		`SELECT recipe_id, glass_count FROM cycles WHERE order_key='ORD-late01'`,
+		`SELECT recipe_id, glass_count FROM cycles WHERE order_id='ORD-late01'`,
 	).Scan(&recipe, &glass)
 	if err != nil {
 		t.Fatalf("read cycle: %v", err)
@@ -1674,7 +1593,7 @@ func TestRecipeArrivesAfterTheCycleWasWritten(t *testing.T) {
 	// in the first tick, before the recipe was known, so filling only the parent would
 	// leave a cycle whose own dwells disagree with it.
 	if r := scalarInt(t, rep,
-		`SELECT COALESCE(recipe_id, -1) FROM step_dwells WHERE order_key='ORD-late01' LIMIT 1`); r != 4 {
+		`SELECT COALESCE(recipe_id, -1) FROM step_dwells WHERE order_id='ORD-late01' LIMIT 1`); r != 4 {
 		t.Errorf("step_dwells.recipe_id = %d, want 4 (backfilled from the late orders row)", r)
 	}
 }
@@ -1692,11 +1611,11 @@ func TestBackfillNeverOverwritesAnExistingRecipe(t *testing.T) {
 	replica := runOnce(t, sourcePath, dir)
 	rep := openRO(t, replica)
 
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-keep01'`); n != 1 {
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_id='ORD-keep01'`); n != 1 {
 		t.Fatalf("cycles rows = %d, want exactly 1", n)
 	}
 	if r := scalarInt(t, rep,
-		`SELECT COALESCE(recipe_id, -1) FROM cycles WHERE order_key='ORD-keep01'`); r != 3 {
+		`SELECT COALESCE(recipe_id, -1) FROM cycles WHERE order_id='ORD-keep01'`); r != 3 {
 		t.Errorf("recipe_id = %d, want 3 — a re-run must not disturb a settled value", r)
 	}
 }
@@ -1715,14 +1634,14 @@ func TestOutcomeAndBucketKeysArePopulated(t *testing.T) {
 	rep := openRO(t, replica)
 
 	if got := scalarStr(t, rep,
-		`SELECT outcome FROM cycles WHERE order_key='ORD-buck01'`); got != "success" {
+		`SELECT outcome FROM cycles WHERE order_id='ORD-buck01'`); got != "success" {
 		t.Errorf("outcome = %q, want %q", got, "success")
 	}
 
 	var b1, b5, b15, started int64
 	err := rep.QueryRow(
 		`SELECT bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, started_at_ms
-		   FROM cycles WHERE order_key='ORD-buck01'`,
+		   FROM cycles WHERE order_id='ORD-buck01'`,
 	).Scan(&b1, &b5, &b15, &started)
 	if err != nil {
 		t.Fatalf("read buckets: %v", err)
@@ -1774,7 +1693,7 @@ func TestMigrationBackfillsBucketsOnExistingRows(t *testing.T) {
 
 	var b5, started int64
 	if err := rep.QueryRow(
-		`SELECT bucket_5m_ms, started_at_ms FROM cycles WHERE order_key='ORD-mig001'`,
+		`SELECT bucket_5m_ms, started_at_ms FROM cycles WHERE order_id='ORD-mig001'`,
 	).Scan(&b5, &started); err != nil {
 		t.Fatalf("read migrated row: %v", err)
 	}
@@ -1782,7 +1701,7 @@ func TestMigrationBackfillsBucketsOnExistingRows(t *testing.T) {
 		t.Errorf("bucket_5m_ms = %d, want %d — the pre-existing row kept the DEFAULT", b5, want)
 	}
 	if got := scalarStr(t, rep,
-		`SELECT outcome FROM cycles WHERE order_key='ORD-mig001'`); got != "success" {
+		`SELECT outcome FROM cycles WHERE order_id='ORD-mig001'`); got != "success" {
 		t.Errorf("migrated outcome = %q, want %q", got, "success")
 	}
 }
@@ -1838,7 +1757,7 @@ func TestStepDwellCarriesSensorBitsAndDecodedInputs(t *testing.T) {
 	rep := openRO(t, replica)
 
 	bits := scalarStr(t, rep,
-		`SELECT sensors_start_bits FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`)
+		`SELECT sensors_start_bits FROM step_dwells WHERE order_id='ORD-sens01' LIMIT 1`)
 	if want := encodeSensorBits(startSnapshot); bits != want {
 		t.Errorf("sensors_start_bits = %q, want %q", bits, want)
 	}
@@ -1848,13 +1767,13 @@ func TestStepDwellCarriesSensorBitsAndDecodedInputs(t *testing.T) {
 	}
 
 	if got := scalarInt(t, rep,
-		`SELECT door_closed FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`); got != 1 {
+		`SELECT door_closed FROM step_dwells WHERE order_id='ORD-sens01' LIMIT 1`); got != 1 {
 		t.Errorf("door_closed = %d, want 1 (X0.0 true means closed)", got)
 	}
 	// X0.7 is absent from the snapshot, so its state is unknown rather than low.
 	var cip sql.NullInt64
 	if err := rep.QueryRow(
-		`SELECT cip_bypass FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`,
+		`SELECT cip_bypass FROM step_dwells WHERE order_id='ORD-sens01' LIMIT 1`,
 	).Scan(&cip); err != nil {
 		t.Fatalf("read cip_bypass: %v", err)
 	}
@@ -1865,7 +1784,7 @@ func TestStepDwellCarriesSensorBitsAndDecodedInputs(t *testing.T) {
 
 	// The end snapshot differs from the start, which is the whole point of carrying both.
 	endBits := scalarStr(t, rep,
-		`SELECT sensors_end_bits FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`)
+		`SELECT sensors_end_bits FROM step_dwells WHERE order_id='ORD-sens01' LIMIT 1`)
 	if endBits == bits {
 		t.Errorf("sensors_end_bits equals sensors_start_bits (%q); the seeded run flips X0.0", bits)
 	}

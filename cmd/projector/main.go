@@ -160,13 +160,11 @@ func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 	// would read as "the machine was idle".
 	if last, err := st.LastAlive(); err == nil && last > 0 {
 		if gap := startedMS - last; gap > int64(2*interval/time.Millisecond) {
-			if err := rep.RecordGap(ctx, last, startedMS, "projector not running"); err != nil {
+			if err := rep.RecordGap(ctx, last, startedMS,
+				"projector not running", version, sourceBranch); err != nil {
 				logf("record gap: %v", err)
 			}
 		}
-	}
-	if err := rep.RecordRun(ctx, startedMS, startedMS, version, sourceBranch, "start"); err != nil {
-		logf("record run: %v", err)
 	}
 
 	if once {
@@ -338,6 +336,12 @@ func (p *projector) tick(ctx context.Context) error {
 	}
 	// Actuator intervals come last: they attach to a cycle, so the parent should exist.
 	if err := p.drainActuators(ctx); err != nil {
+		return err
+	}
+	// Then link each pulse to the dwell it fell inside. Deliberately after both are written:
+	// pulses and dwells arrive on separate cursors, so neither can be attributed to the other
+	// at the moment it lands.
+	if err := p.rep.AttributeActuatorPulses(ctx); err != nil {
 		return err
 	}
 	// Derived tables aggregate rows the steps above have already written, so they run after

@@ -51,19 +51,19 @@ sqlite-replication:
     actuator_intervals:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, src_id, revision, output_id, output_name, started_state, started_step, started_send_ok, ended_state, ended_step, ended_send_ok, fault_type, fault_message, fault_raised_at_ms, fault_cleared_at_ms, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, src_id, revision, output_id, output_name, started_state, started_step, started_send_ok, ended_state, ended_step, ended_send_ok, fault_type, fault_message, fault_raised_at_ms, fault_cleared_at_ms, seq_index, recipe_id, is_production, cycle_result, date_utc]
     cip_runs:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, completed, trigger_source, fault_count, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, completed, fault_count, date_utc]
     config_history:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, changed_at_ms, order_key, config_key, old_value, new_value, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, changed_at_ms, order_id, config_key, old_value, new_value, date_utc]
     cycles:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, is_production, result, outcome, recipe_id, glass_count, terminal_state, terminal_step, fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms, fsm_event_count, step_event_count, state_transition_count, unique_state_count, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, is_production, result, recipe_id, glass_count, terminal_state, terminal_step, fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms, fsm_event_count, step_event_count, state_transition_count, unique_state_count, outcome, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc]
     rollups:
       strategy: telemetry
       ts_column: event_ts
@@ -75,39 +75,23 @@ sqlite-replication:
     door_events:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, opened_at_ms, closed_at_ms, duration_ms, order_key, fault_reset_during, fault_reset_count, first_reset_at_ms, last_reset_at_ms, ms_to_first_reset, state_at_open, step_at_open, state_at_close, step_at_close, opened_in_error, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, opened_at_ms, closed_at_ms, duration_ms, order_id, fault_reset_during, fault_reset_count, first_reset_at_ms, last_reset_at_ms, ms_to_first_reset, state_at_open, step_at_open, state_at_close, step_at_close, opened_in_error, recipe_id, is_production, cycle_result, date_utc]
     fault_events:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, raised_at_ms, cleared_at_ms, downtime_ms, order_key, fault_key, fault_type, severity, recovered, recovery_at_ms, state, step, step_title, message, dwell_seq_index, recipe_id, is_production, cycle_result, cycle_started_at_ms, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc]
-    fsm_events:
-      strategy: telemetry
-      ts_column: event_ts
-      # sensors_bits replaces sensors_json: the same 32 booleans as one character per input
-      # (~34 B on the wire vs ~820, since it has no quotes to escape). Bit order is documented
-      # in cmd/projector/sensors.go and db-overview.md; the frontend decodes it back into the
-      # {tag: bool} object FsmPayloadGrid already renders. sensors_json stays in the replica.
-      include_columns: [id, event_ts, event_at_ms, order_key, src_id, event_kind, state_from, state_to, current_state, step_from, step_to, modbus_order_reg, input_id, input_value, event_type, source, trace_id, payload_json, sensors_bits, is_production, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, raised_at_ms, cleared_at_ms, downtime_ms, order_id, fault_key, fault_type, severity, recovered, recovery_at_ms, state, step, step_title, message, dwell_seq_index, recipe_id, is_production, cycle_result, cycle_started_at_ms, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc]
     gaps:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, reason]
-    projector_runs:
-      strategy: telemetry
-      ts_column: event_ts
-      include_columns: [id, event_ts, started_at_ms, stopped_at_ms, version, source_branch, note]
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, reason, version, source_branch]
     sensor_toggles:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, event_at_ms, order_key, src_id, input_id, input_name, value_from, value_to, current_state, current_step, is_production, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, event_at_ms, order_id, src_id, input_id, input_name, value_from, value_to, current_state, current_step, is_production, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc]
     state_durations:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, entered_at_ms, exited_at_ms, duration_ms, order_key, state, entry_reason, exit_reason, is_downtime, is_production, hour_bucket_ms, date_utc]
-    step_actuators:
-      strategy: telemetry
-      ts_column: event_ts
-      include_columns: [id, event_ts, step_started_at_ms, step_ended_at_ms, order_key, lane, state, step, seq_index, output_id, output_name, total_run_ms, segment_count, recipe_step, recipe_origin_state, recipe_id, is_production, cycle_result, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, entered_at_ms, exited_at_ms, duration_ms, order_id, state, entry_reason, exit_reason, is_downtime, is_production, date_utc]
     step_dwells:
       strategy: telemetry
       ts_column: event_ts
@@ -125,4 +109,4 @@ sqlite-replication:
       #                                          fsm-step-metadata.ts getStepTitle()
       # Together these were ~95% of the row. Without them omega outruns the projector instead
       # of falling further behind it.
-      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, lane, state, step, step_title, seq_index, previous_state, previous_step, event_count, io_event_count, transition_count, fault_count, source_kind, fault_type, fault_message, sensors_start_bits, sensors_end_bits, door_closed, cip_bypass, recipe_id, is_production, cycle_result, cycle_started_at_ms, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc]
+      include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, lane, state, step, step_title, seq_index, previous_state, previous_step, event_count, io_event_count, transition_count, fault_count, sensors_start_bits, sensors_end_bits, door_closed, cip_bypass, source_kind, fault_type, fault_message, recipe_id, is_production, cycle_result, cycle_started_at_ms, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc]

@@ -89,7 +89,7 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 	}
 
 	rows, err := p.rep.db.QueryContext(ctx,
-		`SELECT entered_at_ms, exited_at_ms, order_key
+		`SELECT entered_at_ms, exited_at_ms, order_id
 		   FROM state_durations
 		  WHERE state = 'Maintenance' AND exited_at_ms > ? AND exited_at_ms <= ?
 		  ORDER BY exited_at_ms`, last, upToMS)
@@ -116,10 +116,20 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 
 	high := last
 	for _, s := range spans {
-		// Look for the completion marker on both paths, for the same reason AutoCycle step 19
-		// is detected in both ApplyFSMEvent and ApplyStepRun: a controller carrying
-		// fsm_step_runs skips the dwell derivation from fsm_events entirely, so on one branch
-		// the step appears only as a dwell and on the other only as an event.
+		// Two places, because fsm_events is no longer replicated and neither source alone
+		// covers every controller:
+		//
+		//   step_dwells        the step-run branch writes the dwell directly; on the base
+		//                      branch the same dwell is derived from fsm_events before they
+		//                      are discarded. Maintenance dwells are exempt from idle
+		//                      suppression precisely so this keeps working.
+		//   cycles             a controller that has fsm_step_runs but does not write step
+		//                      runs for Maintenance leaves no dwell at all. The events still
+		//                      pass through the tracker, so the interval records step 7 as
+		//                      where it ended.
+		//
+		// Missing the marker downgrades a finished clean to "interrupted", which is why this
+		// is worth checking twice rather than trusting one path.
 		var completed int64
 		if err := p.rep.db.QueryRowContext(ctx,
 			`SELECT EXISTS(
@@ -127,9 +137,9 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 			    WHERE state = 'Maintenance' AND step = ?
 			      AND started_at_ms >= ? AND started_at_ms < ?
 			   UNION ALL
-			   SELECT 1 FROM fsm_events
-			    WHERE current_state = 'Maintenance' AND step_to = ?
-			      AND event_at_ms >= ? AND event_at_ms < ?)`,
+			   SELECT 1 FROM cycles
+			    WHERE result = 'maintenance' AND terminal_step = ?
+			      AND started_at_ms >= ? AND started_at_ms < ?)`,
 			cipCompleteStep, s.started, s.ended,
 			cipCompleteStep, s.started, s.ended).Scan(&completed); err != nil {
 			return fmt.Errorf("cip completion probe: %w", err)
@@ -146,15 +156,16 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 		if err != nil {
 			return err
 		}
-		// trigger_source is left NULL on purpose. The controller records no distinction
-		// between an automatic clean (the maintenance counter reaching MaintenanceCount) and
-		// one an operator started, and inventing a value would be worse than an honest gap.
+		// No trigger_source column. It was always NULL — the controller records no distinction
+		// between an automatic clean (the maintenance counter reaching MaintenanceCount) and one
+		// an operator started. A column that can never hold a value is not a documented gap; it
+		// is a gap hidden behind something that looks queryable.
 		if _, err := p.rep.db.ExecContext(ctx,
-			`INSERT INTO cip_runs (event_ts, started_at_ms, ended_at_ms, duration_ms, order_key,
-			                       completed, trigger_source, fault_count, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			`INSERT INTO cip_runs (event_ts, started_at_ms, ended_at_ms, duration_ms, order_id,
+			                       completed, fault_count, date_utc)
+			 VALUES (?,?,?,?,?,?,?,?)`,
 			ts, s.started, s.ended, s.ended-s.started, s.orderKey,
-			completed, nil, faultCount, hourBucket(s.started), dateUTC(s.started),
+			completed, faultCount, dateUTC(s.started),
 		); err != nil {
 			return fmt.Errorf("insert cip_run: %w", err)
 		}
@@ -204,23 +215,23 @@ func (p *projector) earliestBucket(ctx context.Context) (int64, bool, error) {
 	var v sql.NullInt64
 	err := p.rep.db.QueryRowContext(ctx,
 		`SELECT MIN(b) FROM (
-		   SELECT MIN(hour_bucket_ms) b FROM cycles
-		   UNION ALL SELECT MIN(hour_bucket_ms) FROM state_durations
-		   UNION ALL SELECT MIN(hour_bucket_ms) FROM fault_events
-		   UNION ALL SELECT MIN(hour_bucket_ms) FROM step_dwells)`).Scan(&v)
+		   SELECT MIN(started_at_ms) b FROM cycles
+		   UNION ALL SELECT MIN(entered_at_ms) FROM state_durations
+		   UNION ALL SELECT MIN(raised_at_ms)  FROM fault_events
+		   UNION ALL SELECT MIN(started_at_ms) FROM step_dwells)`).Scan(&v)
 	if err != nil {
 		return 0, false, fmt.Errorf("earliest bucket: %w", err)
 	}
 	if !v.Valid {
 		return 0, false, nil
 	}
-	return v.Int64, true, nil
+	return hourBucket(v.Int64), true, nil
 }
 
 func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error {
 	bucketEnd := bucketStart + hourMS
 
-	agg, err := p.aggregateCycles(ctx, "hour_bucket_ms = ?", bucketStart)
+	agg, err := p.aggregateCycles(ctx, bucketStart, bucketEnd)
 	if err != nil {
 		return err
 	}
@@ -231,12 +242,14 @@ func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error
 
 	var faultCount, cipCount int64
 	if err := p.rep.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM fault_events WHERE hour_bucket_ms = ?`, bucketStart).
+		`SELECT COUNT(*) FROM fault_events WHERE raised_at_ms >= ? AND raised_at_ms < ?`,
+		bucketStart, bucketEnd).
 		Scan(&faultCount); err != nil {
 		return err
 	}
 	if err := p.rep.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM cip_runs WHERE hour_bucket_ms = ?`, bucketStart).
+		`SELECT COUNT(*) FROM cip_runs WHERE started_at_ms >= ? AND started_at_ms < ?`,
+		bucketStart, bucketEnd).
 		Scan(&cipCount); err != nil {
 		return err
 	}
@@ -283,9 +296,9 @@ func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64
 	rows, err := p.rep.db.QueryContext(ctx,
 		`SELECT fault_type, severity, COUNT(*), COALESCE(SUM(downtime_ms), 0)
 		   FROM fault_events
-		  WHERE hour_bucket_ms = ?
+		  WHERE raised_at_ms >= ? AND raised_at_ms < ?
 		  GROUP BY fault_type, severity
-		  ORDER BY fault_type, severity`, bucketStart)
+		  ORDER BY fault_type, severity`, bucketStart, bucketStart+hourMS)
 	if err != nil {
 		return fmt.Errorf("hourly fault counts: %w", err)
 	}
@@ -334,9 +347,9 @@ func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, 
 	rows, err := p.rep.db.QueryContext(ctx,
 		`SELECT lane, state, step, COUNT(*), COALESCE(SUM(duration_ms), 0), COALESCE(MAX(duration_ms), 0)
 		   FROM step_dwells
-		  WHERE hour_bucket_ms = ?
+		  WHERE started_at_ms >= ? AND started_at_ms < ?
 		  GROUP BY lane, state, step
-		  ORDER BY lane, state, step`, bucketStart)
+		  ORDER BY lane, state, step`, bucketStart, bucketStart+hourMS)
 	if err != nil {
 		return fmt.Errorf("hourly step stats: %w", err)
 	}
@@ -412,7 +425,7 @@ func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
 	dayEnd := dayStart + dayMS
 	date := dateUTC(dayStart)
 
-	agg, err := p.aggregateCycles(ctx, "date_utc = ?", date)
+	agg, err := p.aggregateCycles(ctx, dayStart, dayEnd)
 	if err != nil {
 		return err
 	}
@@ -465,7 +478,13 @@ type cycleAgg struct {
 // aggregateCycles counts production cycles in one bucket. Synthetic intervals (idle,
 // maintenance, manual, error) are excluded from every figure here — they are machine time,
 // not orders, and their duration is accounted for by stateOccupancy instead.
-func (p *projector) aggregateCycles(ctx context.Context, whereCol string, arg any) (cycleAgg, error) {
+// aggregateCycles sums the production cycles that STARTED inside a half-open window.
+//
+// A range on started_at_ms rather than an equality on a stored bucket key: the key was a
+// denormalised copy of exactly this arithmetic, and a range over an indexed column is what the
+// planner wants anyway. Attributing a cycle to the bucket it started in also means a drink
+// spanning a boundary is counted once, in the bucket a person would look for it.
+func (p *projector) aggregateCycles(ctx context.Context, startMS, endMS int64) (cycleAgg, error) {
 	var a cycleAgg
 	err := p.rep.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT COALESCE(SUM(CASE WHEN result = ? THEN COALESCE(glass_count, 0) ELSE 0 END), 0),
@@ -475,9 +494,9 @@ func (p *projector) aggregateCycles(ctx context.Context, whereCol string, arg an
 		       COALESCE(SUM(duration_ms), 0),
 		       COUNT(*)
 		  FROM cycles
-		 WHERE is_production = 1 AND %s`, whereCol),
+		 WHERE is_production = 1 AND started_at_ms >= ? AND started_at_ms < ?`),
 		resultCompleted, resultCompleted,
-		resultFaultedRecoverable, resultFaultedNonRecoverable, arg,
+		resultFaultedRecoverable, resultFaultedNonRecoverable, startMS, endMS,
 	).Scan(&a.glasses, &a.started, &a.completed, &a.faulted, &a.cycleMS, &a.cycleCount)
 	if err != nil {
 		return a, fmt.Errorf("aggregate cycles: %w", err)

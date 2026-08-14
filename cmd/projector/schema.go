@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS cycles (
     started_at_ms          INTEGER NOT NULL,
     ended_at_ms            INTEGER NOT NULL,
     duration_ms            INTEGER NOT NULL,
-    order_key              TEXT    NOT NULL UNIQUE,
+    order_id              TEXT    NOT NULL UNIQUE,
     is_production          INTEGER NOT NULL,   -- 1 real order, 0 synthetic interval
     result                 TEXT    NOT NULL,   -- completed | faulted_recoverable
                                                -- | faulted_non_recoverable | aborted
@@ -81,7 +81,6 @@ CREATE TABLE IF NOT EXISTS cycles (
     bucket_1m_ms           INTEGER NOT NULL DEFAULT 0,
     bucket_5m_ms           INTEGER NOT NULL DEFAULT 0,
     bucket_15m_ms          INTEGER NOT NULL DEFAULT 0,
-    hour_bucket_ms         INTEGER NOT NULL,
     date_utc               TEXT    NOT NULL
 );
 
@@ -93,12 +92,12 @@ CREATE TABLE IF NOT EXISTS step_dwells (
     started_at_ms       INTEGER NOT NULL,
     ended_at_ms         INTEGER NOT NULL,
     duration_ms         INTEGER NOT NULL,
-    order_key           TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id           TEXT    NOT NULL REFERENCES cycles(order_id),
     lane                TEXT    NOT NULL,      -- main | tilter | crusher
     state               TEXT    NOT NULL,
     step                INTEGER,
     step_title          TEXT,
-    seq_index           INTEGER NOT NULL,      -- unique within (order_key, lane)
+    seq_index           INTEGER NOT NULL,      -- unique within (order_id, lane)
     previous_state      TEXT,                  -- only when sourced from fsm_step_runs
     previous_step       INTEGER,
     event_count         INTEGER,
@@ -115,7 +114,6 @@ CREATE TABLE IF NOT EXISTS step_dwells (
     -- carried verbatim from the firmware. step_actuators flattens actuators_json into rows
     -- but keeps only the first segment's recipe_step / recipe_origin_state, so the raw blob
     -- is what preserves multi-pulse detail. sensors_trace_json has no flattened form at all.
-    sensors_trace_json  TEXT,
     actuators_json      TEXT,
     source_kind         TEXT    NOT NULL,      -- step_runs | derived
     -- The fault that interrupted this step, denormalised by the firmware onto the step run
@@ -130,36 +128,9 @@ CREATE TABLE IF NOT EXISTS step_dwells (
     bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
-    hour_bucket_ms      INTEGER NOT NULL,
     date_utc            TEXT    NOT NULL
 );
 
--- Per-output run time within one step. Only available from fsm_step_runs, which carries
--- actuators_json; recipe_step / recipe_origin_state disambiguate e.g. AutoCycle step 10
--- from Tilter step 10 when a step boundary splits one physical ON pulse.
-CREATE TABLE IF NOT EXISTS step_actuators (
-    id                  INTEGER PRIMARY KEY,
-    event_ts            TEXT    NOT NULL,      -- parent step END
-    step_started_at_ms  INTEGER NOT NULL,
-    step_ended_at_ms    INTEGER NOT NULL,
-    order_key           TEXT    NOT NULL REFERENCES cycles(order_key),
-    lane                TEXT    NOT NULL,
-    state               TEXT    NOT NULL,
-    step                INTEGER,
-    step_title          TEXT,
-    seq_index           INTEGER NOT NULL,
-    output_id           TEXT    NOT NULL,     -- coil address, e.g. Y0.1 (the actuators_json map key)
-    output_name         TEXT    NOT NULL,
-    total_run_ms        INTEGER NOT NULL,
-    segment_count       INTEGER NOT NULL,
-    recipe_step         INTEGER,
-    recipe_origin_state TEXT,
-    recipe_id           INTEGER,
-    is_production       INTEGER NOT NULL,
-    cycle_result        TEXT,
-    hour_bucket_ms      INTEGER NOT NULL,
-    date_utc            TEXT    NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS state_durations (
     id             INTEGER PRIMARY KEY,
@@ -167,13 +138,12 @@ CREATE TABLE IF NOT EXISTS state_durations (
     entered_at_ms  INTEGER NOT NULL,
     exited_at_ms   INTEGER NOT NULL,
     duration_ms    INTEGER NOT NULL,
-    order_key      TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id      TEXT    NOT NULL REFERENCES cycles(order_id),
     state          TEXT    NOT NULL,
     entry_reason   TEXT,
     exit_reason    TEXT,
     is_downtime    INTEGER NOT NULL,           -- 1 when Error or Maintenance
     is_production  INTEGER NOT NULL,
-    hour_bucket_ms INTEGER NOT NULL,
     date_utc       TEXT    NOT NULL
 );
 
@@ -183,7 +153,7 @@ CREATE TABLE IF NOT EXISTS fault_events (
     raised_at_ms        INTEGER NOT NULL,
     cleared_at_ms       INTEGER,
     downtime_ms         INTEGER,
-    order_key           TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id           TEXT    NOT NULL REFERENCES cycles(order_id),
     fault_key           TEXT    NOT NULL UNIQUE,
     fault_type          TEXT    NOT NULL,
     severity            TEXT    NOT NULL,      -- device-classified
@@ -201,7 +171,6 @@ CREATE TABLE IF NOT EXISTS fault_events (
     bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
-    hour_bucket_ms      INTEGER NOT NULL,
     date_utc            TEXT    NOT NULL
 );
 
@@ -211,7 +180,7 @@ CREATE TABLE IF NOT EXISTS actuator_intervals (
     started_at_ms       INTEGER NOT NULL,
     ended_at_ms         INTEGER NOT NULL,
     duration_ms         INTEGER NOT NULL,      -- never COALESCEd to 0
-    order_key           TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id           TEXT    NOT NULL REFERENCES cycles(order_id),
     src_id              INTEGER NOT NULL,
     revision            INTEGER NOT NULL DEFAULT 0,
     output_id           TEXT    NOT NULL,
@@ -226,10 +195,12 @@ CREATE TABLE IF NOT EXISTS actuator_intervals (
     fault_message       TEXT,
     fault_raised_at_ms  INTEGER,
     fault_cleared_at_ms INTEGER,
+    seq_index           INTEGER,               -- the dwell this pulse fell inside; attributed
+                                               -- after both are written, since pulses and
+                                               -- dwells arrive on separate cursors
     recipe_id           INTEGER,
     is_production       INTEGER NOT NULL,
     cycle_result        TEXT,
-    hour_bucket_ms      INTEGER NOT NULL,
     date_utc            TEXT    NOT NULL
 );
 
@@ -246,7 +217,7 @@ CREATE TABLE IF NOT EXISTS door_events (
     opened_at_ms         INTEGER NOT NULL,
     closed_at_ms         INTEGER NOT NULL,
     duration_ms          INTEGER NOT NULL,     -- how long the door stood open
-    order_key            TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id            TEXT    NOT NULL REFERENCES cycles(order_id),
     fault_reset_during   INTEGER NOT NULL,     -- 1 if X0.7 rose while the door was open
     fault_reset_count    INTEGER NOT NULL,     -- more than one means repeated attempts
     first_reset_at_ms    INTEGER,
@@ -260,7 +231,6 @@ CREATE TABLE IF NOT EXISTS door_events (
     recipe_id            INTEGER,
     is_production        INTEGER NOT NULL,
     cycle_result         TEXT,
-    hour_bucket_ms       INTEGER NOT NULL,
     date_utc             TEXT    NOT NULL
 );
 
@@ -270,50 +240,18 @@ CREATE TABLE IF NOT EXISTS cip_runs (
     started_at_ms  INTEGER NOT NULL,
     ended_at_ms    INTEGER NOT NULL,
     duration_ms    INTEGER NOT NULL,
-    order_key      TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id      TEXT    NOT NULL REFERENCES cycles(order_id),
     completed      INTEGER NOT NULL,
-    trigger_source TEXT,                       -- auto | manual ("trigger" is reserved)
     fault_count    INTEGER,
-    hour_bucket_ms INTEGER NOT NULL,
     date_utc       TEXT    NOT NULL
 );
 
--- ═══════════ raw mirrors — drill-down ═══════════
-
-CREATE TABLE IF NOT EXISTS fsm_events (
-    id               INTEGER PRIMARY KEY,
-    event_ts         TEXT    NOT NULL,
-    event_at_ms      INTEGER NOT NULL,
-    order_key        TEXT    NOT NULL REFERENCES cycles(order_key),
-    src_id           INTEGER NOT NULL,
-    event_kind       TEXT    NOT NULL,
-    state_from       TEXT,
-    state_to         TEXT,
-    current_state    TEXT,
-    step_from        INTEGER,
-    step_to          INTEGER,
-    modbus_order_reg INTEGER,                  -- renamed from source order_id
-    input_id         TEXT,
-    input_value      INTEGER,
-    event_type       TEXT,
-    source           TEXT,
-    trace_id         TEXT,
-    payload_json     TEXT,
-    sensors_json     TEXT,
-    -- The same snapshot as one character per input, in the order documented in sensors.go.
-    -- 32 bytes with nothing to escape, against ~820 on the wire for sensors_json — this is
-    -- the column that ships; sensors_json stays local for inspection.
-    sensors_bits     TEXT,
-    is_production    INTEGER NOT NULL,
-    hour_bucket_ms   INTEGER NOT NULL,
-    date_utc         TEXT    NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS sensor_toggles (
     id             INTEGER PRIMARY KEY,
     event_ts       TEXT    NOT NULL,
     event_at_ms    INTEGER NOT NULL,
-    order_key      TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id      TEXT    NOT NULL REFERENCES cycles(order_id),
     src_id         INTEGER NOT NULL,
     input_id       TEXT    NOT NULL,
     input_name     TEXT    NOT NULL,
@@ -325,7 +263,6 @@ CREATE TABLE IF NOT EXISTS sensor_toggles (
     bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
     bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
-    hour_bucket_ms INTEGER NOT NULL,
     date_utc       TEXT    NOT NULL
 );
 
@@ -335,11 +272,10 @@ CREATE TABLE IF NOT EXISTS config_history (
     id             INTEGER PRIMARY KEY,
     event_ts       TEXT    NOT NULL,
     changed_at_ms  INTEGER NOT NULL,
-    order_key      TEXT    NOT NULL REFERENCES cycles(order_key),
+    order_id      TEXT    NOT NULL REFERENCES cycles(order_id),
     config_key     TEXT    NOT NULL,
     old_value      TEXT,
     new_value      TEXT,
-    hour_bucket_ms INTEGER NOT NULL,
     date_utc       TEXT    NOT NULL
 );
 
@@ -392,59 +328,37 @@ CREATE TABLE IF NOT EXISTS rollups (
 );
 
 
-
-
--- ═══════════ collector health ═══════════
-
-CREATE TABLE IF NOT EXISTS projector_runs (
-    id            INTEGER PRIMARY KEY,
-    event_ts      TEXT    NOT NULL,
-    started_at_ms INTEGER NOT NULL,
-    stopped_at_ms INTEGER,
-    version       TEXT,
-    source_branch TEXT,                        -- which controller schema was detected
-    note          TEXT
-);
-
 CREATE TABLE IF NOT EXISTS gaps (
     id            INTEGER PRIMARY KEY,
     event_ts      TEXT    NOT NULL,            -- gap END
     started_at_ms INTEGER NOT NULL,
     ended_at_ms   INTEGER,
     duration_ms   INTEGER,
-    order_key     TEXT REFERENCES cycles(order_key),
-    reason        TEXT
+    order_id     TEXT REFERENCES cycles(order_id),
+    reason        TEXT,
+    version       TEXT,                        -- projector build that covered this period
+    source_branch TEXT                         -- which controller schema it detected
 );
 
 -- Indexes are excluded from the schema fingerprint, so these are free to add or change.
--- order_key and the time buckets are indexed everywhere: they are the admin dashboard's
+-- order_id and the time buckets are indexed everywhere: they are the admin dashboard's
 -- primary filters.
 CREATE INDEX IF NOT EXISTS idx_cycles_ts              ON cycles(event_ts);
-CREATE INDEX IF NOT EXISTS idx_cycles_bucket          ON cycles(hour_bucket_ms);
 CREATE INDEX IF NOT EXISTS idx_cycles_date            ON cycles(date_utc, is_production);
 CREATE INDEX IF NOT EXISTS idx_step_dwells_ts         ON step_dwells(event_ts);
-CREATE INDEX IF NOT EXISTS idx_step_dwells_order      ON step_dwells(order_key, lane, seq_index);
-CREATE INDEX IF NOT EXISTS idx_step_dwells_bucket     ON step_dwells(hour_bucket_ms, lane, step);
-CREATE INDEX IF NOT EXISTS idx_step_actuators_ts      ON step_actuators(event_ts);
-CREATE INDEX IF NOT EXISTS idx_step_actuators_order   ON step_actuators(order_key, seq_index);
-CREATE INDEX IF NOT EXISTS idx_step_actuators_bucket  ON step_actuators(hour_bucket_ms, output_name);
+CREATE INDEX IF NOT EXISTS idx_step_dwells_order      ON step_dwells(order_id, lane, seq_index);
 CREATE INDEX IF NOT EXISTS idx_state_durations_ts     ON state_durations(event_ts);
-CREATE INDEX IF NOT EXISTS idx_state_durations_order  ON state_durations(order_key);
-CREATE INDEX IF NOT EXISTS idx_state_durations_down   ON state_durations(hour_bucket_ms, is_downtime);
+CREATE INDEX IF NOT EXISTS idx_state_durations_order  ON state_durations(order_id);
 CREATE INDEX IF NOT EXISTS idx_fault_events_ts        ON fault_events(event_ts);
-CREATE INDEX IF NOT EXISTS idx_fault_events_order     ON fault_events(order_key);
-CREATE INDEX IF NOT EXISTS idx_fault_events_bucket    ON fault_events(hour_bucket_ms, fault_type);
+CREATE INDEX IF NOT EXISTS idx_fault_events_order     ON fault_events(order_id);
 CREATE INDEX IF NOT EXISTS idx_actuator_intervals_ts  ON actuator_intervals(event_ts);
-CREATE INDEX IF NOT EXISTS idx_actuator_intervals_ord ON actuator_intervals(order_key, output_id);
-CREATE INDEX IF NOT EXISTS idx_cip_runs_order         ON cip_runs(order_key);
+CREATE INDEX IF NOT EXISTS idx_actuator_intervals_ord ON actuator_intervals(order_id, output_id);
+CREATE INDEX IF NOT EXISTS idx_cip_runs_order         ON cip_runs(order_id);
 CREATE INDEX IF NOT EXISTS idx_door_events_ts         ON door_events(event_ts);
-CREATE INDEX IF NOT EXISTS idx_door_events_order      ON door_events(order_key);
-CREATE INDEX IF NOT EXISTS idx_door_events_reset      ON door_events(hour_bucket_ms, fault_reset_during);
-CREATE INDEX IF NOT EXISTS idx_fsm_events_ts          ON fsm_events(event_ts);
-CREATE INDEX IF NOT EXISTS idx_fsm_events_order       ON fsm_events(order_key, event_at_ms);
+CREATE INDEX IF NOT EXISTS idx_door_events_order      ON door_events(order_id);
 CREATE INDEX IF NOT EXISTS idx_sensor_toggles_ts      ON sensor_toggles(event_ts);
-CREATE INDEX IF NOT EXISTS idx_sensor_toggles_order   ON sensor_toggles(order_key, event_at_ms);
-CREATE INDEX IF NOT EXISTS idx_config_history_order   ON config_history(order_key);
+CREATE INDEX IF NOT EXISTS idx_sensor_toggles_order   ON sensor_toggles(order_id, event_at_ms);
+CREATE INDEX IF NOT EXISTS idx_config_history_order   ON config_history(order_id);
 CREATE INDEX IF NOT EXISTS idx_rollups_lookup          ON rollups(grain, dim_kind, bucket_start_ms);
 `
 

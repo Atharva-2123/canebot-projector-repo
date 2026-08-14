@@ -226,103 +226,13 @@ func openReplica(path string, st *stateStore) (*replicaWriter, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := backfillSensorBits(db); err != nil {
-		db.Close()
-		return nil, err
-	}
 	return &replicaWriter{db: db, st: st}, nil
 }
 
-// backfillSensorBits fills sensors_bits on rows written before that column existed.
-//
-// ALTER TABLE ADD COLUMN leaves existing rows NULL, so without this every event already in the
-// replica would ship with no sensor state at all — sensors_json is no longer replicated, so
-// there would be nothing else carrying it. The JSON is still in the replica, so the bits can
-// simply be computed from it.
-//
-// Worth doing promptly rather than never: the agent ships by cursor, so any row it has not yet
-// reached picks the bits up automatically, while rows already sent stay as they went.
-//
-// Pagination is by id rather than by re-running the predicate. A row whose snapshot will not
-// parse encodes to the empty string, which nullIfEmpty stores as NULL — so a predicate-only
-// loop would select it again forever. Walking id forward can only terminate.
-func backfillSensorBits(db *sql.DB) error {
-	const batchRows = 2000
-	var lastID, total int64
-
-	for {
-		type pending struct {
-			id   int64
-			json string
-		}
-		var batch []pending
-
-		rows, err := db.Query(
-			`SELECT id, sensors_json FROM fsm_events
-			  WHERE id > ? AND sensors_bits IS NULL
-			    AND sensors_json IS NOT NULL AND sensors_json <> ''
-			  ORDER BY id LIMIT ?`, lastID, batchRows)
-		if err != nil {
-			return fmt.Errorf("backfill sensors_bits: %w", err)
-		}
-		for rows.Next() {
-			var p pending
-			if err := rows.Scan(&p.id, &p.json); err != nil {
-				rows.Close()
-				return fmt.Errorf("backfill sensors_bits: %w", err)
-			}
-			batch = append(batch, p)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if len(batch) == 0 {
-			break
-		}
-
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-		stmt, err := tx.Prepare(`UPDATE fsm_events SET sensors_bits = ? WHERE id = ?`)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		for _, p := range batch {
-			if _, err := stmt.Exec(nullIfEmpty(encodeSensorBits(p.json)), p.id); err != nil {
-				stmt.Close()
-				tx.Rollback()
-				return fmt.Errorf("backfill sensors_bits: %w", err)
-			}
-			lastID = p.id
-		}
-		stmt.Close()
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("backfill sensors_bits: %w", err)
-		}
-		total += int64(len(batch))
-	}
-
-	if total > 0 {
-		log.Printf("projector: backfilled sensors_bits on %d rows", total)
-	}
-	return nil
-}
-
-// migrateReplica adds columns to a replica created by an earlier build. The schema above is
-// all CREATE TABLE IF NOT EXISTS, so an existing file keeps its original shape and every
-// insert naming a new column fails — the replica is rebuildable, but a deployed one holds up
-// to 14 days of history that has not shipped yet, so it is migrated rather than discarded.
-//
-// Additive only, and each step is guarded on the column being absent, so running it against
-// an already-current replica is a no-op.
 func migrateReplica(db *sql.DB) error {
 	migrations := []struct{ table, column, ddl, backfill string }{
 		{"step_dwells", "fault_type", `ALTER TABLE step_dwells ADD COLUMN fault_type TEXT`, ""},
 		{"step_dwells", "fault_message", `ALTER TABLE step_dwells ADD COLUMN fault_message TEXT`, ""},
-		{"fsm_events", "sensors_bits", `ALTER TABLE fsm_events ADD COLUMN sensors_bits TEXT`, ""},
 
 		// The step's sensor snapshot, as bits. The JSON forms are held back from replication
 		// at ~820 B/row, so without these the cloud has no sensor state for a step at all —
@@ -607,15 +517,15 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 	prod := boolToInt(iv.isProduction)
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO cycles (event_ts, started_at_ms, ended_at_ms, duration_ms, order_key,
+		`INSERT INTO cycles (event_ts, started_at_ms, ended_at_ms, duration_ms, order_id,
 		                     is_production, result, recipe_id, glass_count,
 		                     terminal_state, terminal_step,
 		                     fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms,
 		                     fsm_event_count, step_event_count, state_transition_count,
 		                     unique_state_count, outcome,
-		                     bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(order_key) DO UPDATE SET
+		                     bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(order_id) DO UPDATE SET
 		     recipe_id   = COALESCE(cycles.recipe_id,   excluded.recipe_id),
 		     glass_count = COALESCE(cycles.glass_count, excluded.glass_count)`,
 		cycleTS, iv.startedMS, iv.endedMS, iv.endedMS-iv.startedMS, iv.orderKey,
@@ -625,7 +535,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		iv.fsmEventCount, iv.stepEventCount, iv.stateTransitionCount, len(iv.uniqueStates),
 		outcomeFor(iv.result, iv.isProduction),
 		bucket1m(iv.startedMS), bucket5m(iv.startedMS), bucket15m(iv.startedMS),
-		hourBucket(iv.startedMS), dateUTC(iv.startedMS),
+		dateUTC(iv.startedMS),
 	); err != nil {
 		return fmt.Errorf("insert cycle %s: %w", iv.orderKey, err)
 	}
@@ -642,11 +552,11 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 	// idempotent across re-runs and cannot corrupt settled rows.
 	if iv.recipeID != nil || iv.glassCount != nil {
 		for _, child := range []string{
-			"step_dwells", "step_actuators", "fault_events", "door_events", "actuator_intervals",
+			"step_dwells", "fault_events", "door_events", "actuator_intervals",
 		} {
 			if _, err := tx.ExecContext(ctx,
 				fmt.Sprintf(
-					`UPDATE %s SET recipe_id = ? WHERE order_key = ? AND recipe_id IS NULL`,
+					`UPDATE %s SET recipe_id = ? WHERE order_id = ? AND recipe_id IS NULL`,
 					child),
 				iv.recipeID, iv.orderKey,
 			); err != nil {
@@ -662,40 +572,24 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		}
 	}
 
-	for _, e := range iv.events {
-		ts := eventTS(e.eventAtMS)
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO fsm_events (event_ts, event_at_ms, order_key, src_id, event_kind,
-			                         state_from, state_to, current_state, step_from, step_to,
-			                         modbus_order_reg, input_id, input_value, event_type,
-			                         source, trace_id, payload_json, sensors_json, sensors_bits,
-			                         is_production, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			ts, e.eventAtMS, e.orderKey, e.srcID, e.eventKind,
-			nullIfEmpty(e.stateFrom), nullIfEmpty(e.stateTo), nullIfEmpty(e.currentState),
-			e.stepFrom, e.stepTo,
-			e.modbusOrderReg, nullIfEmpty(e.inputID), e.inputValue, nullIfEmpty(e.eventType),
-			nullIfEmpty(e.source), nullIfEmpty(e.traceID),
-			nullIfEmpty(e.payloadJSON), nullIfEmpty(e.sensorsJSON),
-			nullIfEmpty(encodeSensorBits(e.sensorsJSON)),
-			prod, hourBucket(e.eventAtMS), dateUTC(e.eventAtMS),
-		); err != nil {
-			return fmt.Errorf("insert fsm_event src=%d: %w", e.srcID, err)
-		}
-		track(ts)
-	}
+	// fsm_events is deliberately not replicated. It was the largest table by an order of
+	// magnitude, every row of it derived into step_dwells, state_durations and fault_events
+	// before it left the device, and on the live machine it carried no production orders at
+	// all. The raw stream stays in the controller's own database for local drill-down.
+	//
+	// iv.events is still collected: the per-cycle counters on `cycles` are computed from it.
 
 	for _, s := range iv.stateDurations {
 		ts := eventTS(s.exitedAtMS)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO state_durations (event_ts, entered_at_ms, exited_at_ms, duration_ms,
-			                              order_key, state, entry_reason, exit_reason,
-			                              is_downtime, is_production, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                              order_id, state, entry_reason, exit_reason,
+			                              is_downtime, is_production, date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, s.enteredAtMS, s.exitedAtMS, s.durationMS,
 			s.orderKey, s.state, nullIfEmpty(s.entryReason), nullIfEmpty(s.exitReason),
 			isDowntimeState(s.state), prod,
-			hourBucket(s.enteredAtMS), dateUTC(s.enteredAtMS),
+			dateUTC(s.enteredAtMS),
 		); err != nil {
 			return fmt.Errorf("insert state_duration: %w", err)
 		}
@@ -706,17 +600,17 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		ts := eventTS(d.endedAtMS)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO step_dwells (event_ts, started_at_ms, ended_at_ms, duration_ms,
-			                          order_key, lane, state, step, step_title, seq_index,
+			                          order_id, lane, state, step, step_title, seq_index,
 			                          previous_state, previous_step,
 			                          event_count, io_event_count, transition_count, fault_count,
 			                          sensors_start_bits, sensors_end_bits, door_closed, cip_bypass,
 			                          sensors_start_json, sensors_end_json,
-			                          sensors_trace_json, actuators_json, source_kind,
+			                          actuators_json, source_kind,
 			                          fault_type, fault_message,
 			                          recipe_id, is_production, cycle_result, cycle_started_at_ms,
 			                          bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
-			                          hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                          date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, d.startedAtMS, d.endedAtMS, d.durationMS,
 			d.orderKey, d.lane, d.state, d.step, nullIfEmpty(stepTitle(d.state, d.step)), d.seqIndex,
 			nullIfEmpty(d.previousState), d.previousStep,
@@ -724,38 +618,19 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			nullIfEmpty(encodeSensorBits(d.sensorsStart)), nullIfEmpty(encodeSensorBits(d.sensorsEnd)),
 			doorClosed(d.sensorsStart), cipBypass(d.sensorsStart),
 			nullIfEmpty(d.sensorsStart), nullIfEmpty(d.sensorsEnd),
-			nullIfEmpty(d.sensorsTrace), nullIfEmpty(d.actuatorsJSON), d.sourceKind,
+			nullIfEmpty(d.actuatorsJSON), d.sourceKind,
 			nullIfEmpty(d.faultType), nullIfEmpty(d.faultMessage),
 			iv.recipeID, prod, iv.result, iv.startedMS,
 			bucket1m(d.startedAtMS), bucket5m(d.startedAtMS), bucket15m(d.startedAtMS),
-			hourBucket(d.startedAtMS), dateUTC(d.startedAtMS),
+			dateUTC(d.startedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert step_dwell: %w", err)
 		}
 		track(ts)
 	}
 
-	for _, a := range iv.stepActuators {
-		ts := eventTS(a.stepEndedAtMS)
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO step_actuators (event_ts, step_started_at_ms, step_ended_at_ms,
-			                             order_key, lane, state, step, step_title, seq_index,
-			                             output_id, output_name, total_run_ms, segment_count,
-			                             recipe_step, recipe_origin_state,
-			                             recipe_id, is_production, cycle_result,
-			                             hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			ts, a.stepStartedAtMS, a.stepEndedAtMS,
-			a.orderKey, a.lane, a.state, a.step, nullIfEmpty(stepTitle(a.state, a.step)), a.seqIndex,
-			a.outputID, a.outputName, a.totalRunMS, a.segmentCount,
-			a.recipeStep, nullIfEmpty(a.recipeOriginState),
-			iv.recipeID, prod, iv.result,
-			hourBucket(a.stepStartedAtMS), dateUTC(a.stepStartedAtMS),
-		); err != nil {
-			return fmt.Errorf("insert step_actuator: %w", err)
-		}
-		track(ts)
-	}
+	// step_actuators was per-output totals inside one step run. It is not written any more:
+	// actuator_intervals already holds every pulse, and the totals are a GROUP BY over it.
 
 	for _, f := range iv.faults {
 		at := f.raisedAtMS
@@ -766,13 +641,13 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		var stepPtr = f.step
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO fault_events (event_ts, raised_at_ms, cleared_at_ms, downtime_ms,
-			                           order_key, fault_key, fault_type, severity,
+			                           order_id, fault_key, fault_type, severity,
 			                           recovered, recovery_at_ms, state, step, step_title,
 			                           message, dwell_seq_index,
 			                           recipe_id, is_production, cycle_result, cycle_started_at_ms,
 			                           bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
-			                           hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			                           date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(fault_key) DO NOTHING`,
 			ts, f.raisedAtMS, f.clearedAtMS, f.downtimeMS,
 			f.orderKey, f.faultKey, f.faultType, f.severity,
@@ -781,7 +656,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			nullIfEmpty(f.message), f.dwellSeqIndex,
 			iv.recipeID, prod, iv.result, iv.startedMS,
 			bucket1m(f.raisedAtMS), bucket5m(f.raisedAtMS), bucket15m(f.raisedAtMS),
-			hourBucket(f.raisedAtMS), dateUTC(f.raisedAtMS),
+			dateUTC(f.raisedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert fault_event: %w", err)
 		}
@@ -791,19 +666,19 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 	for _, s := range iv.toggles {
 		ts := eventTS(s.eventAtMS)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO sensor_toggles (event_ts, event_at_ms, order_key, src_id,
+			`INSERT INTO sensor_toggles (event_ts, event_at_ms, order_id, src_id,
 			                             input_id, input_name, value_from, value_to,
 			                             current_state, current_step,
 			                             is_production,
 			                             bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
-			                             hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                             date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, s.eventAtMS, s.orderKey, s.srcID,
 			s.inputID, s.inputName, s.valueFrom, s.valueTo,
 			nullIfEmpty(s.currentState), s.currentStep,
 			prod,
 			bucket1m(s.eventAtMS), bucket5m(s.eventAtMS), bucket15m(s.eventAtMS),
-			hourBucket(s.eventAtMS), dateUTC(s.eventAtMS),
+			dateUTC(s.eventAtMS),
 		); err != nil {
 			return fmt.Errorf("insert sensor_toggle: %w", err)
 		}
@@ -814,13 +689,13 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		ts := eventTS(d.closedAtMS)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO door_events (event_ts, opened_at_ms, closed_at_ms, duration_ms,
-			                          order_key, fault_reset_during, fault_reset_count,
+			                          order_id, fault_reset_during, fault_reset_count,
 			                          first_reset_at_ms, last_reset_at_ms, ms_to_first_reset,
 			                          state_at_open, step_at_open, state_at_close, step_at_close,
 			                          opened_in_error,
 			                          recipe_id, is_production, cycle_result,
-			                          hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                          date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, d.openedAtMS, d.closedAtMS, d.durationMS,
 			d.orderKey, boolToInt(d.faultResetCount > 0), d.faultResetCount,
 			d.firstResetAtMS, d.lastResetAtMS, d.msToFirstReset,
@@ -828,7 +703,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			nullIfEmpty(d.stateAtClose), d.stepAtClose,
 			boolToInt(d.openedInError),
 			iv.recipeID, prod, iv.result,
-			hourBucket(d.openedAtMS), dateUTC(d.openedAtMS),
+			dateUTC(d.openedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert door_event: %w", err)
 		}
@@ -838,12 +713,12 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 	for _, c := range iv.configs {
 		ts := eventTS(c.changedAtMS)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO config_history (event_ts, changed_at_ms, order_key, config_key,
-			                             old_value, new_value, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?)`,
+			`INSERT INTO config_history (event_ts, changed_at_ms, order_id, config_key,
+			                             old_value, new_value, date_utc)
+			 VALUES (?,?,?,?,?,?,?)`,
 			ts, c.changedAtMS, c.orderKey, c.configKey,
 			nullIfEmpty(c.oldValue), nullIfEmpty(c.newValue),
-			hourBucket(c.changedAtMS), dateUTC(c.changedAtMS),
+			dateUTC(c.changedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert config_history: %w", err)
 		}
@@ -857,8 +732,8 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 	// Watermarks advance only after a successful commit, so a crash mid-flush replays
 	// rather than skips.
 	w.st.SetWatermark("cycles", cycleTS)
-	for _, tbl := range []string{"fsm_events", "state_durations", "step_dwells",
-		"step_actuators", "fault_events", "sensor_toggles", "config_history",
+	for _, tbl := range []string{"state_durations", "step_dwells",
+		"fault_events", "sensor_toggles", "config_history",
 		"door_events"} {
 		w.st.SetWatermark(tbl, maxTS)
 	}
@@ -875,14 +750,14 @@ func (w *replicaWriter) WriteActuatorInterval(ctx context.Context, a outActuator
 	}
 	if _, err := w.db.ExecContext(ctx,
 		`INSERT INTO actuator_intervals (event_ts, started_at_ms, ended_at_ms, duration_ms,
-		                                 order_key, src_id, revision, output_id, output_name,
+		                                 order_id, src_id, revision, output_id, output_name,
 		                                 started_state, started_step, started_send_ok,
 		                                 ended_state, ended_step, ended_send_ok,
 		                                 fault_type, fault_message,
 		                                 fault_raised_at_ms, fault_cleared_at_ms,
 		                                 recipe_id, is_production, cycle_result,
-		                                 hour_bucket_ms, date_utc)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		                                 date_utc)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ts, a.startedAtMS, a.endedAtMS, a.durationMS,
 		a.orderKey, a.srcID, a.revision, a.outputID, a.outputName,
 		nullIfEmpty(a.startedState), a.startedStep, a.startedSendOK,
@@ -890,7 +765,7 @@ func (w *replicaWriter) WriteActuatorInterval(ctx context.Context, a outActuator
 		nullIfEmpty(a.faultType), nullIfEmpty(a.faultMessage),
 		a.faultRaisedAtMS, a.faultClearedAtMS,
 		cc.recipeID, cc.isProduction, nullIfEmpty(cc.result),
-		hourBucket(a.startedAtMS), dateUTC(a.startedAtMS),
+		dateUTC(a.startedAtMS),
 	); err != nil {
 		return fmt.Errorf("insert actuator_interval src=%d: %w", a.srcID, err)
 	}
@@ -903,7 +778,7 @@ func (w *replicaWriter) WriteActuatorInterval(ctx context.Context, a outActuator
 func (w *replicaWriter) CycleContext(ctx context.Context, orderKey string) (cycleContext, bool, error) {
 	var cc cycleContext
 	err := w.db.QueryRowContext(ctx,
-		`SELECT recipe_id, is_production, result, started_at_ms FROM cycles WHERE order_key = ?`,
+		`SELECT recipe_id, is_production, result, started_at_ms FROM cycles WHERE order_id = ?`,
 		orderKey).Scan(&cc.recipeID, &cc.isProduction, &cc.result, &cc.startedAtMS)
 	if err == sql.ErrNoRows {
 		return cc, false, nil
@@ -914,38 +789,52 @@ func (w *replicaWriter) CycleContext(ctx context.Context, orderKey string) (cycl
 	return cc, true, nil
 }
 
-// RecordRun writes the collector-liveness heartbeat. Without this there is no way to tell
-// "the machine was idle" from "the projector was down", which silently corrupts any
-// availability figure computed downstream.
-func (w *replicaWriter) RecordRun(ctx context.Context, startedMS, nowMS int64, version, branch, note string) error {
-	ts, err := w.guard("projector_runs", nowMS)
-	if err != nil {
-		return err
-	}
-	if _, err := w.db.ExecContext(ctx,
-		`INSERT INTO projector_runs (event_ts, started_at_ms, stopped_at_ms, version, source_branch, note)
-		 VALUES (?,?,?,?,?,?)`,
-		ts, startedMS, nil, version, nullIfEmpty(branch), nullIfEmpty(note)); err != nil {
-		return err
-	}
-	w.st.SetWatermark("projector_runs", ts)
-	return nil
-}
-
 // RecordGap records a stretch where the projector was not running, so downstream can tell
 // missing data from a genuinely idle machine.
-func (w *replicaWriter) RecordGap(ctx context.Context, startedMS, endedMS int64, reason string) error {
+// It also carries the projector build and the controller schema it detected. Those used to
+// live on projector_runs, whose only other content was a start timestamp and a stopped_at_ms
+// that was NULL on every row ever written — the run table never recorded a clean shutdown, so
+// it answered the same question as this one, worse.
+func (w *replicaWriter) RecordGap(
+	ctx context.Context, startedMS, endedMS int64, reason, version, branch string,
+) error {
 	ts, err := w.guard("gaps", endedMS)
 	if err != nil {
 		return err
 	}
 	if _, err := w.db.ExecContext(ctx,
-		`INSERT INTO gaps (event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, reason)
-		 VALUES (?,?,?,?,?,?)`,
-		ts, startedMS, endedMS, endedMS-startedMS, nil, reason); err != nil {
+		`INSERT INTO gaps (event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, reason,
+		                   version, source_branch)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		ts, startedMS, endedMS, endedMS-startedMS, nil, reason,
+		nullIfEmpty(version), nullIfEmpty(branch)); err != nil {
 		return err
 	}
 	w.st.SetWatermark("gaps", ts)
+	return nil
+}
+
+// AttributeActuatorPulses links each pulse to the step dwell it fell inside.
+//
+// The two arrive on separate read cursors — pulses from actuator_output_intervals, dwells from
+// fsm_step_runs or derived from the event stream — so a pulse cannot be attributed at the
+// moment it is written. Doing it as a set operation afterwards is both simpler and correct
+// regardless of which arrived first.
+//
+// Only fills a null, so it is idempotent and cannot renumber a pulse that was already placed.
+func (w *replicaWriter) AttributeActuatorPulses(ctx context.Context) error {
+	_, err := w.db.ExecContext(ctx, `
+		UPDATE actuator_intervals
+		   SET seq_index = (
+		       SELECT d.seq_index FROM step_dwells d
+		        WHERE d.order_id = actuator_intervals.order_id
+		          AND actuator_intervals.started_at_ms >= d.started_at_ms
+		          AND actuator_intervals.started_at_ms <  d.ended_at_ms
+		        ORDER BY d.started_at_ms LIMIT 1)
+		 WHERE seq_index IS NULL`)
+	if err != nil {
+		return fmt.Errorf("attribute actuator pulses: %w", err)
+	}
 	return nil
 }
 
@@ -955,11 +844,9 @@ func (w *replicaWriter) RecordGap(ctx context.Context, startedMS, endedMS int64,
 // source database already has.
 func (w *replicaWriter) Prune(ctx context.Context, olderThan time.Time) error {
 	cutoff := eventTS(olderThan.UnixMilli())
-	tables := []string{"fsm_events", "sensor_toggles", "config_history", "state_durations",
-		"step_dwells", "step_actuators", "fault_events", "actuator_intervals", "cip_runs",
-		"door_events",
-		"hourly_rollups", "hourly_fault_counts", "hourly_step_stats", "daily_rollups",
-		"projector_runs", "gaps"}
+	tables := []string{"sensor_toggles", "config_history", "state_durations",
+		"step_dwells", "fault_events", "actuator_intervals", "cip_runs",
+		"door_events", "rollups", "gaps"}
 	for _, t := range tables {
 		if _, err := w.db.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE event_ts < ?`, t), cutoff); err != nil {
