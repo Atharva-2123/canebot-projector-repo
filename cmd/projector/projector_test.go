@@ -1533,7 +1533,6 @@ func TestRollupsAreNotDuplicatedOnRerun(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Late-arriving orders row
 // ---------------------------------------------------------------------------
@@ -1880,6 +1879,10 @@ func TestRollupsCarryBothGrainsAndDimensions(t *testing.T) {
 	sourcePath, db := newSourceDB(t)
 	seedCompletedCycle(t, db, "ORD-roll01", base)
 	seedFault(t, db, "ORD-roll01", "CrusherMotorFault", 4, base.Add(5*time.Second))
+	// The step dimension is derived from step_dwells, and this source carries fsm_step_runs —
+	// so the dwells come from there, not from the step_changed events seedCompletedCycle writes.
+	seedStepRun(t, db, "ORD-roll01", "AutoCycle", 3,
+		base.Add(2*time.Second), base.Add(6*time.Second), "AutoCycle", nil, "")
 	// Push the clock past the day boundary so both the hour and the day close.
 	seedTransition(t, db, "", "AutoCycle", "HomeIdle", base.Add(30*time.Hour))
 
@@ -1888,7 +1891,13 @@ func TestRollupsCarryBothGrainsAndDimensions(t *testing.T) {
 	for _, c := range []struct{ name, where string }{
 		{"machine hour", `grain='hour' AND dim_kind='machine'`},
 		{"machine day", `grain='day' AND dim_kind='machine'`},
-		{"fault type", `grain='hour' AND dim_kind='fault_type'`},
+		{"fault type hour", `grain='hour' AND dim_kind='fault_type'`},
+		{"step hour", `grain='hour' AND dim_kind='step'`},
+		// The day grain must carry every dimension the hour grain does. A single dashboard
+		// query is capped at 1,000 rows, so a quarter of hourly fault rows is rejected
+		// outright — without these the long time filters have nothing to read.
+		{"fault type day", `grain='day' AND dim_kind='fault_type'`},
+		{"step day", `grain='day' AND dim_kind='step'`},
 	} {
 		if n := scalarInt(t, rep, `SELECT COUNT(*) FROM rollups WHERE `+c.where); n == 0 {
 			t.Errorf("no %s rows in rollups", c.name)
@@ -1915,6 +1924,18 @@ func TestRollupsCarryBothGrainsAndDimensions(t *testing.T) {
 	if dayGlasses != hourGlasses {
 		t.Errorf("day glasses = %d but hours sum to %d; the grains must agree",
 			dayGlasses, hourGlasses)
+	}
+
+	// The same additivity has to hold on the dimensional rows, or a panel would report a
+	// different fault total depending only on how wide a range the reader picked.
+	for _, dim := range []string{"fault_type", "step"} {
+		day := scalarInt(t, rep, `SELECT COALESCE(SUM(occurrences),0) FROM rollups
+			WHERE grain='day' AND dim_kind='`+dim+`'`)
+		hour := scalarInt(t, rep, `SELECT COALESCE(SUM(occurrences),0) FROM rollups
+			WHERE grain='hour' AND dim_kind='`+dim+`'`)
+		if day != hour {
+			t.Errorf("%s: day occurrences = %d but hours sum to %d", dim, day, hour)
+		}
 	}
 }
 

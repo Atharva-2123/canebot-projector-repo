@@ -278,13 +278,19 @@ func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error
 	}
 	p.rep.st.SetWatermark("hourly_rollups", ts)
 
-	if err := p.emitHourlyFaultCounts(ctx, bucketStart, ts); err != nil {
+	if err := p.emitFaultTypeRollups(ctx, grainHour, bucketStart, bucketEnd, ts); err != nil {
 		return err
 	}
-	return p.emitHourlyStepStats(ctx, bucketStart, ts)
+	return p.emitStepRollups(ctx, grainHour, bucketStart, bucketEnd, ts)
 }
 
-func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64, ts string) error {
+// emitFaultTypeRollups writes one row per fault type over [bucketStart, bucketEnd).
+//
+// Grouped by fault_type alone even though severity rides along: severity is a pure function of
+// the fault type (see tracker.severity), so grouping by both would produce the same rows while
+// making it possible for two of them to collide on the (grain, bucket, dim_kind, dim_key)
+// unique key — where ON CONFLICT DO NOTHING would silently drop the second one's count.
+func (p *projector) emitFaultTypeRollups(ctx context.Context, grain string, bucketStart, bucketEnd int64, ts string) error {
 	// Read fully before writing. The replica is capped at one connection, so an INSERT issued
 	// while this result set is still open waits for a connection that only closing it frees.
 	type row struct {
@@ -294,11 +300,11 @@ func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64
 	var out []row
 
 	rows, err := p.rep.db.QueryContext(ctx,
-		`SELECT fault_type, severity, COUNT(*), COALESCE(SUM(downtime_ms), 0)
+		`SELECT fault_type, MIN(severity), COUNT(*), COALESCE(SUM(downtime_ms), 0)
 		   FROM fault_events
 		  WHERE raised_at_ms >= ? AND raised_at_ms < ?
-		  GROUP BY fault_type, severity
-		  ORDER BY fault_type, severity`, bucketStart, bucketStart+hourMS)
+		  GROUP BY fault_type
+		  ORDER BY fault_type`, bucketStart, bucketEnd)
 	if err != nil {
 		return fmt.Errorf("hourly fault counts: %w", err)
 	}
@@ -321,10 +327,10 @@ func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64
 			                      severity, occurrences, duration_ms_sum)
 			 VALUES (?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
-			ts, grainHour, bucketStart, dateUTC(bucketStart), dimFaultType, r.faultType,
+			ts, grain, bucketStart, dateUTC(bucketStart), dimFaultType, r.faultType,
 			r.severity, r.occurrences, r.downtime,
 		); err != nil {
-			return fmt.Errorf("insert hourly_fault_count: %w", err)
+			return fmt.Errorf("insert %s fault_type rollup: %w", grain, err)
 		}
 	}
 	if len(out) > 0 {
@@ -333,7 +339,8 @@ func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64
 	return nil
 }
 
-func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, ts string) error {
+// emitStepRollups writes one row per (state, step) over [bucketStart, bucketEnd).
+func (p *projector) emitStepRollups(ctx context.Context, grain string, bucketStart, bucketEnd int64, ts string) error {
 	// duration_ms_max is carried alongside the sum because an average hides the outlier that
 	// is usually the thing worth looking at.
 	// Same single-connection rule as emitHourlyFaultCounts: drain the query before inserting.
@@ -349,7 +356,7 @@ func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, 
 		   FROM step_dwells
 		  WHERE started_at_ms >= ? AND started_at_ms < ?
 		  GROUP BY lane, state, step
-		  ORDER BY lane, state, step`, bucketStart, bucketStart+hourMS)
+		  ORDER BY lane, state, step`, bucketStart, bucketEnd)
 	if err != nil {
 		return fmt.Errorf("hourly step stats: %w", err)
 	}
@@ -379,10 +386,10 @@ func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, 
 			                      lane, occurrences, duration_ms_sum, duration_ms_max)
 			 VALUES (?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
-			ts, grainHour, bucketStart, dateUTC(bucketStart), dimStep, stepDimKey(r.state, stepPtr),
+			ts, grain, bucketStart, dateUTC(bucketStart), dimStep, stepDimKey(r.state, stepPtr),
 			r.lane, r.count, r.sum, r.ms,
 		); err != nil {
-			return fmt.Errorf("insert hourly_step_stat: %w", err)
+			return fmt.Errorf("insert %s step rollup: %w", grain, err)
 		}
 	}
 	if len(out) > 0 {
@@ -457,6 +464,19 @@ func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
 		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,
 	); err != nil {
 		return fmt.Errorf("insert daily_rollup: %w", err)
+	}
+
+	// The same two dimensions the hour grain carries, re-aggregated over the day.
+	//
+	// Not a convenience: a single interactive query is capped at 1,000 rows, so a 90-day range
+	// of hourly fault rows (2,160 buckets before the fault-type fan-out) is rejected outright.
+	// Without a day grain for these, the long windows in the dashboard's time filter have no
+	// readable source at all.
+	if err := p.emitFaultTypeRollups(ctx, grainDay, dayStart, dayEnd, ts); err != nil {
+		return err
+	}
+	if err := p.emitStepRollups(ctx, grainDay, dayStart, dayEnd, ts); err != nil {
+		return err
 	}
 	p.rep.st.SetWatermark("daily_rollups", ts)
 	return nil
