@@ -1810,3 +1810,77 @@ func TestOutcomeMapping(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Step sensor state
+// ---------------------------------------------------------------------------
+
+// The JSON snapshots are held back from replication at ~820 B/row, and fsm_events — the only
+// other table carrying sensor state — is on its way out of the replication set. So the step's
+// own snapshot has to travel as bits, and the two inputs with documented meaning have to be
+// queryable, because the dashboard's query language has no substring operator.
+func TestStepDwellCarriesSensorBitsAndDecodedInputs(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+
+	// seedStepRun writes the snapshots the firmware would: X0.0 true at the step start and
+	// false at its end. X0.0 true = door CLOSED, which is the firmware's own convention and
+	// the reason the column is named for the meaning rather than the pin.
+	const startSnapshot = `{"X0.0":true}`
+	seedOrder(t, db, "ORD-sens01", 2, base)
+	seedStepRun(t, db, "ORD-sens01", "AutoCycle", 3,
+		base.Add(1*time.Second), base.Add(2*time.Second), "", nil, "")
+
+	replica := runOnce(t, sourcePath, t.TempDir())
+	rep := openRO(t, replica)
+
+	bits := scalarStr(t, rep,
+		`SELECT sensors_start_bits FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`)
+	if want := encodeSensorBits(startSnapshot); bits != want {
+		t.Errorf("sensors_start_bits = %q, want %q", bits, want)
+	}
+	if len(bits) != len(sensorBitOrder) {
+		t.Errorf("sensors_start_bits is %d chars, want the fixed %d — a variable width is what "+
+			"makes a misaligned decode undetectable", len(bits), len(sensorBitOrder))
+	}
+
+	if got := scalarInt(t, rep,
+		`SELECT door_closed FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`); got != 1 {
+		t.Errorf("door_closed = %d, want 1 (X0.0 true means closed)", got)
+	}
+	// X0.7 is absent from the snapshot, so its state is unknown rather than low.
+	var cip sql.NullInt64
+	if err := rep.QueryRow(
+		`SELECT cip_bypass FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`,
+	).Scan(&cip); err != nil {
+		t.Fatalf("read cip_bypass: %v", err)
+	}
+	if cip.Valid {
+		t.Errorf("cip_bypass = %d, want NULL — X0.7 is not in the snapshot, so it is unknown",
+			cip.Int64)
+	}
+
+	// The end snapshot differs from the start, which is the whole point of carrying both.
+	endBits := scalarStr(t, rep,
+		`SELECT sensors_end_bits FROM step_dwells WHERE order_key='ORD-sens01' LIMIT 1`)
+	if endBits == bits {
+		t.Errorf("sensors_end_bits equals sensors_start_bits (%q); the seeded run flips X0.0", bits)
+	}
+}
+
+// No snapshot and every input reading low are different facts. A step run that recorded
+// nothing must not claim the door was open.
+func TestMissingSnapshotIsNullNotZero(t *testing.T) {
+	if v := doorClosed(""); v != nil {
+		t.Errorf("doorClosed(\"\") = %v, want nil", *v)
+	}
+	if v := doorClosed("{}"); v != nil {
+		t.Errorf("doorClosed(\"{}\") = %v, want nil", *v)
+	}
+	// Present but absent from the snapshot is also unknown, not false.
+	if v := doorClosed(`{"X0.4":true}`); v != nil {
+		t.Errorf("doorClosed with X0.0 absent = %v, want nil", *v)
+	}
+	if v := doorClosed(`{"X0.0":false}`); v == nil || *v != 0 {
+		t.Errorf("doorClosed with X0.0 false = %v, want 0", v)
+	}
+}

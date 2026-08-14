@@ -91,3 +91,50 @@ func encodeSensorBits(sensorsJSON string) string {
 	}
 	return b.String()
 }
+
+// sensorValue reads one input out of a snapshot, as 1, 0, or absent.
+//
+// The bit string is 32 characters with no separators, and the dashboard queries this replica
+// through a JSON DSL with no substring operator — so "every step where the door was open" is
+// unaskable against sensors_bits, however cheap the decode is in the client. Lifting the two
+// inputs whose meaning is documented into their own columns makes that a WHERE clause.
+//
+// Only these two are lifted. Thirty-two boolean columns to answer two questions would be the
+// wrong trade, and the rest stay in the bit string where a client that wants them can decode
+// it with the order in this file.
+//
+// Returns nil when there is no snapshot at all, which is not the same as the input reading
+// low — a step run that recorded nothing must not claim the door was open.
+func sensorValue(sensorsJSON string, tag io.Input) *int64 {
+	s := strings.TrimSpace(sensorsJSON)
+	if s == "" || s == "{}" || s == "null" {
+		return nil
+	}
+	var snapshot map[string]bool
+	if err := json.Unmarshal([]byte(s), &snapshot); err != nil {
+		return nil
+	}
+	v, ok := snapshot[string(tag)]
+	if !ok {
+		return nil
+	}
+	var out int64
+	if v {
+		out = 1
+	}
+	return &out
+}
+
+// doorClosed reports the main door switch, which the firmware wires true = CLOSED. The column
+// is named for what the value means rather than for the pin, so a reader cannot invert it by
+// accident.
+func doorClosed(sensorsJSON string) *int64 {
+	return sensorValue(sensorsJSON, io.InputMainDoorSwitch)
+}
+
+// cipBypass reports the CIP bypass switch. Its RISING EDGE is the fault reset, so a 1 here is
+// the switch position at that instant, not evidence that a reset happened — door_events
+// carries the edge count for that.
+func cipBypass(sensorsJSON string) *int64 {
+	return sensorValue(sensorsJSON, io.InputCIPBypassSwitch)
+}

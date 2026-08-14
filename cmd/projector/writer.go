@@ -324,6 +324,19 @@ func migrateReplica(db *sql.DB) error {
 		{"step_dwells", "fault_message", `ALTER TABLE step_dwells ADD COLUMN fault_message TEXT`, ""},
 		{"fsm_events", "sensors_bits", `ALTER TABLE fsm_events ADD COLUMN sensors_bits TEXT`, ""},
 
+		// The step's sensor snapshot, as bits. The JSON forms are held back from replication
+		// at ~820 B/row, so without these the cloud has no sensor state for a step at all —
+		// and fsm_events, which carries the only other copy, is the table this schema is
+		// working towards not replicating.
+		{"step_dwells", "sensors_start_bits",
+			`ALTER TABLE step_dwells ADD COLUMN sensors_start_bits TEXT`, ""},
+		{"step_dwells", "sensors_end_bits",
+			`ALTER TABLE step_dwells ADD COLUMN sensors_end_bits TEXT`, ""},
+		{"step_dwells", "door_closed",
+			`ALTER TABLE step_dwells ADD COLUMN door_closed INTEGER`, ""},
+		{"step_dwells", "cip_bypass",
+			`ALTER TABLE step_dwells ADD COLUMN cip_bypass INTEGER`, ""},
+
 		// The outcome the charts stack, as a column rather than eight result values the
 		// dashboard has to collapse itself. QueryScript has no CASE, so without this every
 		// orders chart reimplements the mapping in JavaScript and the copies drift.
@@ -614,17 +627,20 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			                          order_key, lane, state, step, step_title, seq_index,
 			                          previous_state, previous_step,
 			                          event_count, io_event_count, transition_count, fault_count,
+			                          sensors_start_bits, sensors_end_bits, door_closed, cip_bypass,
 			                          sensors_start_json, sensors_end_json,
 			                          sensors_trace_json, actuators_json, source_kind,
 			                          fault_type, fault_message,
 			                          recipe_id, is_production, cycle_result, cycle_started_at_ms,
 			                          bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
 			                          hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, d.startedAtMS, d.endedAtMS, d.durationMS,
 			d.orderKey, d.lane, d.state, d.step, nullIfEmpty(stepTitle(d.state, d.step)), d.seqIndex,
 			nullIfEmpty(d.previousState), d.previousStep,
 			d.eventCount, d.ioEventCount, d.transitionCount, d.faultCount,
+			nullIfEmpty(encodeSensorBits(d.sensorsStart)), nullIfEmpty(encodeSensorBits(d.sensorsEnd)),
+			doorClosed(d.sensorsStart), cipBypass(d.sensorsStart),
 			nullIfEmpty(d.sensorsStart), nullIfEmpty(d.sensorsEnd),
 			nullIfEmpty(d.sensorsTrace), nullIfEmpty(d.actuatorsJSON), d.sourceKind,
 			nullIfEmpty(d.faultType), nullIfEmpty(d.faultMessage),

@@ -105,6 +105,10 @@ CREATE TABLE IF NOT EXISTS step_dwells (
     io_event_count      INTEGER,
     transition_count    INTEGER,
     fault_count         INTEGER,
+    sensors_start_bits  TEXT,
+    sensors_end_bits    TEXT,
+    door_closed         INTEGER,
+    cip_bypass          INTEGER,
     sensors_start_json  TEXT,                  -- only when sourced from fsm_step_runs
     sensors_end_json    TEXT,
     -- Every input edge during the step, and the full per-output actuator breakdown, both
