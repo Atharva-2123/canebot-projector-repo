@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS cycles (
     step_event_count       INTEGER,
     state_transition_count INTEGER,
     unique_state_count     INTEGER,
+    outcome                TEXT    NOT NULL DEFAULT '',
+    bucket_1m_ms           INTEGER NOT NULL DEFAULT 0,
+    bucket_5m_ms           INTEGER NOT NULL DEFAULT 0,
+    bucket_15m_ms          INTEGER NOT NULL DEFAULT 0,
     hour_bucket_ms         INTEGER NOT NULL,
     date_utc               TEXT    NOT NULL
 );
@@ -119,6 +123,9 @@ CREATE TABLE IF NOT EXISTS step_dwells (
     is_production       INTEGER NOT NULL,
     cycle_result        TEXT,
     cycle_started_at_ms INTEGER,
+    bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
     hour_bucket_ms      INTEGER NOT NULL,
     date_utc            TEXT    NOT NULL
 );
@@ -187,6 +194,9 @@ CREATE TABLE IF NOT EXISTS fault_events (
     is_production       INTEGER NOT NULL,
     cycle_result        TEXT,
     cycle_started_at_ms INTEGER,
+    bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
     hour_bucket_ms      INTEGER NOT NULL,
     date_utc            TEXT    NOT NULL
 );
@@ -308,6 +318,9 @@ CREATE TABLE IF NOT EXISTS sensor_toggles (
     current_state  TEXT,
     current_step   INTEGER,
     is_production  INTEGER NOT NULL,
+    bucket_1m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_5m_ms   INTEGER NOT NULL DEFAULT 0,
+    bucket_15m_ms  INTEGER NOT NULL DEFAULT 0,
     hour_bucket_ms INTEGER NOT NULL,
     date_utc       TEXT    NOT NULL
 );

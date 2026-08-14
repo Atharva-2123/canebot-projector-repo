@@ -319,11 +319,57 @@ func backfillSensorBits(db *sql.DB) error {
 // Additive only, and each step is guarded on the column being absent, so running it against
 // an already-current replica is a no-op.
 func migrateReplica(db *sql.DB) error {
-	migrations := []struct{ table, column, ddl string }{
-		{"step_dwells", "fault_type", `ALTER TABLE step_dwells ADD COLUMN fault_type TEXT`},
-		{"step_dwells", "fault_message", `ALTER TABLE step_dwells ADD COLUMN fault_message TEXT`},
-		{"fsm_events", "sensors_bits", `ALTER TABLE fsm_events ADD COLUMN sensors_bits TEXT`},
+	migrations := []struct{ table, column, ddl, backfill string }{
+		{"step_dwells", "fault_type", `ALTER TABLE step_dwells ADD COLUMN fault_type TEXT`, ""},
+		{"step_dwells", "fault_message", `ALTER TABLE step_dwells ADD COLUMN fault_message TEXT`, ""},
+		{"fsm_events", "sensors_bits", `ALTER TABLE fsm_events ADD COLUMN sensors_bits TEXT`, ""},
+
+		// The outcome the charts stack, as a column rather than eight result values the
+		// dashboard has to collapse itself. QueryScript has no CASE, so without this every
+		// orders chart reimplements the mapping in JavaScript and the copies drift.
+		{"cycles", "outcome",
+			`ALTER TABLE cycles ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+			`UPDATE cycles SET outcome = CASE
+			     WHEN is_production = 0                 THEN 'non_production'
+			     WHEN result = 'completed'              THEN 'success'
+			     WHEN result = 'faulted_recoverable'    THEN 'recovered'
+			     ELSE 'failed'
+			 END
+			 WHERE outcome = ''`},
 	}
+
+	// Bucket keys, so a time series is a GROUP BY rather than a client-side loop.
+	// QueryScript has no time_bucket(); these are the widths the dashboard's presets use.
+	//
+	// Backfilled from each row's own start timestamp — a DEFAULT of 0 would put every
+	// pre-existing row in the same bucket at the epoch, which is worse than not having the
+	// column at all.
+	for _, b := range []struct{ table, startCol string }{
+		{"cycles", "started_at_ms"},
+		{"fault_events", "raised_at_ms"},
+		{"step_dwells", "started_at_ms"},
+		{"sensor_toggles", "event_at_ms"},
+	} {
+		for _, w := range []struct {
+			col     string
+			widthMS int64
+		}{
+			{"bucket_1m_ms", 60_000},
+			{"bucket_5m_ms", 5 * 60_000},
+			{"bucket_15m_ms", 15 * 60_000},
+		} {
+			migrations = append(migrations, struct{ table, column, ddl, backfill string }{
+				table:  b.table,
+				column: w.col,
+				ddl: fmt.Sprintf(
+					`ALTER TABLE %s ADD COLUMN %s INTEGER NOT NULL DEFAULT 0`, b.table, w.col),
+				backfill: fmt.Sprintf(
+					`UPDATE %s SET %s = %s - (%s %% %d) WHERE %s = 0`,
+					b.table, w.col, b.startCol, b.startCol, w.widthMS, w.col),
+			})
+		}
+	}
+
 	for _, m := range migrations {
 		has, err := replicaHasColumn(db, m.table, m.column)
 		if err != nil {
@@ -334,6 +380,12 @@ func migrateReplica(db *sql.DB) error {
 		}
 		if _, err := db.Exec(m.ddl); err != nil {
 			return fmt.Errorf("migrate replica %s.%s: %w", m.table, m.column, err)
+		}
+		if m.backfill == "" {
+			continue
+		}
+		if _, err := db.Exec(m.backfill); err != nil {
+			return fmt.Errorf("backfill replica %s.%s: %w", m.table, m.column, err)
 		}
 	}
 	return nil
@@ -378,6 +430,42 @@ func eventTS(ms int64) string {
 func hourBucket(ms int64) int64 {
 	const hourMS = int64(time.Hour / time.Millisecond)
 	return ms - (ms % hourMS)
+}
+
+// Sub-hour bucket keys.
+//
+// QueryScript, which the dashboard queries through, has no time_bucket() and no window
+// functions — so without a column to GROUP BY, every time series is built by pulling raw
+// rows and bucketing them in the browser. These are the three widths the dashboard's own
+// presets select (1 minute for a 5-minute window, 5 for an hour, 15 for eight hours);
+// anything coarser is served from the rollups instead.
+func bucketMS(ms, widthMS int64) int64 { return ms - (ms % widthMS) }
+
+func bucket1m(ms int64) int64  { return bucketMS(ms, 60_000) }
+func bucket5m(ms int64) int64  { return bucketMS(ms, 5*60_000) }
+func bucket15m(ms int64) int64 { return bucketMS(ms, 15*60_000) }
+
+// outcomeFor collapses the eight result values into the three the charts stack.
+//
+// `result` stays as the audit trail — it distinguishes an aborted cycle from a
+// non-recoverable fault, which matters when diagnosing. `outcome` is the serving column,
+// and it exists because QueryScript has no CASE: without it the mapping lives in the
+// dashboard, in as many copies as there are charts.
+func outcomeFor(result string, isProduction bool) string {
+	if !isProduction {
+		return "non_production"
+	}
+	switch result {
+	case resultCompleted:
+		return "success"
+	case resultFaultedRecoverable:
+		return "recovered"
+	default:
+		// faulted_non_recoverable and aborted both mean the drink was not made. The old
+		// dashboard had no bucket for aborted at all, so folding it in here matches what
+		// the charts already showed rather than inventing a fourth series.
+		return "failed"
+	}
 }
 
 // dateUTC is the UTC calendar date. Everything in this pipeline is UTC; there is no shift
@@ -429,8 +517,9 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		                     terminal_state, terminal_step,
 		                     fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms,
 		                     fsm_event_count, step_event_count, state_transition_count,
-		                     unique_state_count, hour_bucket_ms, date_utc)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		                     unique_state_count, outcome,
+		                     bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(order_key) DO UPDATE SET
 		     recipe_id   = COALESCE(cycles.recipe_id,   excluded.recipe_id),
 		     glass_count = COALESCE(cycles.glass_count, excluded.glass_count)`,
@@ -439,6 +528,8 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		nullIfEmpty(iv.terminalState), iv.terminalStep,
 		iv.faultCount, nullIfEmpty(iv.dominantFaultType), iv.firstFaultMS, iv.lastFaultMS,
 		iv.fsmEventCount, iv.stepEventCount, iv.stateTransitionCount, len(iv.uniqueStates),
+		outcomeFor(iv.result, iv.isProduction),
+		bucket1m(iv.startedMS), bucket5m(iv.startedMS), bucket15m(iv.startedMS),
 		hourBucket(iv.startedMS), dateUTC(iv.startedMS),
 	); err != nil {
 		return fmt.Errorf("insert cycle %s: %w", iv.orderKey, err)
@@ -527,8 +618,9 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			                          sensors_trace_json, actuators_json, source_kind,
 			                          fault_type, fault_message,
 			                          recipe_id, is_production, cycle_result, cycle_started_at_ms,
+			                          bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
 			                          hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, d.startedAtMS, d.endedAtMS, d.durationMS,
 			d.orderKey, d.lane, d.state, d.step, nullIfEmpty(stepTitle(d.state, d.step)), d.seqIndex,
 			nullIfEmpty(d.previousState), d.previousStep,
@@ -537,6 +629,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			nullIfEmpty(d.sensorsTrace), nullIfEmpty(d.actuatorsJSON), d.sourceKind,
 			nullIfEmpty(d.faultType), nullIfEmpty(d.faultMessage),
 			iv.recipeID, prod, iv.result, iv.startedMS,
+			bucket1m(d.startedAtMS), bucket5m(d.startedAtMS), bucket15m(d.startedAtMS),
 			hourBucket(d.startedAtMS), dateUTC(d.startedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert step_dwell: %w", err)
@@ -579,8 +672,9 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			                           recovered, recovery_at_ms, state, step, step_title,
 			                           message, dwell_seq_index,
 			                           recipe_id, is_production, cycle_result, cycle_started_at_ms,
+			                           bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
 			                           hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(fault_key) DO NOTHING`,
 			ts, f.raisedAtMS, f.clearedAtMS, f.downtimeMS,
 			f.orderKey, f.faultKey, f.faultType, f.severity,
@@ -588,6 +682,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			nullIfEmpty(stepTitle(f.state, &stepPtr)),
 			nullIfEmpty(f.message), f.dwellSeqIndex,
 			iv.recipeID, prod, iv.result, iv.startedMS,
+			bucket1m(f.raisedAtMS), bucket5m(f.raisedAtMS), bucket15m(f.raisedAtMS),
 			hourBucket(f.raisedAtMS), dateUTC(f.raisedAtMS),
 		); err != nil {
 			return fmt.Errorf("insert fault_event: %w", err)
@@ -601,12 +696,16 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 			`INSERT INTO sensor_toggles (event_ts, event_at_ms, order_key, src_id,
 			                             input_id, input_name, value_from, value_to,
 			                             current_state, current_step,
-			                             is_production, hour_bucket_ms, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			                             is_production,
+			                             bucket_1m_ms, bucket_5m_ms, bucket_15m_ms,
+			                             hour_bucket_ms, date_utc)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			ts, s.eventAtMS, s.orderKey, s.srcID,
 			s.inputID, s.inputName, s.valueFrom, s.valueTo,
 			nullIfEmpty(s.currentState), s.currentStep,
-			prod, hourBucket(s.eventAtMS), dateUTC(s.eventAtMS),
+			prod,
+			bucket1m(s.eventAtMS), bucket5m(s.eventAtMS), bucket15m(s.eventAtMS),
+			hourBucket(s.eventAtMS), dateUTC(s.eventAtMS),
 		); err != nil {
 			return fmt.Errorf("insert sensor_toggle: %w", err)
 		}

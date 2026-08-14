@@ -1696,3 +1696,117 @@ func TestBackfillNeverOverwritesAnExistingRecipe(t *testing.T) {
 		t.Errorf("recipe_id = %d, want 3 — a re-run must not disturb a settled value", r)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Serving columns: outcome and the sub-hour bucket keys
+// ---------------------------------------------------------------------------
+
+// QueryScript has no CASE and no time_bucket(), so a dashboard reading this replica cannot
+// collapse `result` into chart series or group rows into time buckets by itself without
+// pulling every raw row and doing it in the browser. Both are computed here instead.
+func TestOutcomeAndBucketKeysArePopulated(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	seedCompletedCycle(t, db, "ORD-buck01", base)
+	replica := runOnce(t, sourcePath, t.TempDir())
+	rep := openRO(t, replica)
+
+	if got := scalarStr(t, rep,
+		`SELECT outcome FROM cycles WHERE order_key='ORD-buck01'`); got != "success" {
+		t.Errorf("outcome = %q, want %q", got, "success")
+	}
+
+	var b1, b5, b15, started int64
+	err := rep.QueryRow(
+		`SELECT bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, started_at_ms
+		   FROM cycles WHERE order_key='ORD-buck01'`,
+	).Scan(&b1, &b5, &b15, &started)
+	if err != nil {
+		t.Fatalf("read buckets: %v", err)
+	}
+
+	for _, c := range []struct {
+		name  string
+		got   int64
+		width int64
+	}{
+		{"bucket_1m_ms", b1, 60_000},
+		{"bucket_5m_ms", b5, 5 * 60_000},
+		{"bucket_15m_ms", b15, 15 * 60_000},
+	} {
+		want := started - (started % c.width)
+		if c.got != want {
+			t.Errorf("%s = %d, want %d (floor of started_at_ms)", c.name, c.got, want)
+		}
+		if c.got%c.width != 0 {
+			t.Errorf("%s = %d is not aligned to its %dms width", c.name, c.got, c.width)
+		}
+	}
+}
+
+// A replica written before these columns existed is migrated in place. ALTER TABLE leaves
+// every existing row at the DEFAULT, so without a backfill they would all claim to belong to
+// the same bucket at the epoch — worse than not having the column, because it looks valid.
+func TestMigrationBackfillsBucketsOnExistingRows(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	dir := t.TempDir()
+	seedCompletedCycle(t, db, "ORD-mig001", base)
+	replica := runOnce(t, sourcePath, dir)
+
+	// Drop the columns back off to simulate a replica from before this change, then let the
+	// projector migrate it on its next open.
+	rw, err := sql.Open("sqlite", "file:"+replica)
+	if err != nil {
+		t.Fatalf("open replica rw: %v", err)
+	}
+	for _, col := range []string{"outcome", "bucket_1m_ms", "bucket_5m_ms", "bucket_15m_ms"} {
+		if _, err := rw.Exec(`ALTER TABLE cycles DROP COLUMN ` + col); err != nil {
+			t.Fatalf("drop %s: %v", col, err)
+		}
+	}
+	rw.Close()
+
+	replica = runOnce(t, sourcePath, dir)
+	rep := openRO(t, replica)
+
+	var b5, started int64
+	if err := rep.QueryRow(
+		`SELECT bucket_5m_ms, started_at_ms FROM cycles WHERE order_key='ORD-mig001'`,
+	).Scan(&b5, &started); err != nil {
+		t.Fatalf("read migrated row: %v", err)
+	}
+	if want := started - (started % (5 * 60_000)); b5 != want {
+		t.Errorf("bucket_5m_ms = %d, want %d — the pre-existing row kept the DEFAULT", b5, want)
+	}
+	if got := scalarStr(t, rep,
+		`SELECT outcome FROM cycles WHERE order_key='ORD-mig001'`); got != "success" {
+		t.Errorf("migrated outcome = %q, want %q", got, "success")
+	}
+}
+
+// The full mapping, including the values the integration test above cannot reach without
+// constructing every kind of interval. `result` keeps all eight values as the audit trail;
+// `outcome` is the three the charts stack, plus the bucket for machine time that is not a
+// drink at all.
+func TestOutcomeMapping(t *testing.T) {
+	cases := []struct {
+		result       string
+		isProduction bool
+		want         string
+	}{
+		{resultCompleted, true, "success"},
+		{resultFaultedRecoverable, true, "recovered"},
+		{resultFaultedNonRecoverable, true, "failed"},
+		// aborted means the drink was not made. The dashboard has three series and never had
+		// a bucket for it, so it joins the failures rather than becoming a fourth.
+		{resultAborted, true, "failed"},
+		{resultIdle, false, "non_production"},
+		{resultMaintenance, false, "non_production"},
+		{resultManual, false, "non_production"},
+		{resultError, false, "non_production"},
+	}
+	for _, c := range cases {
+		if got := outcomeFor(c.result, c.isProduction); got != c.want {
+			t.Errorf("outcomeFor(%q, %v) = %q, want %q", c.result, c.isProduction, got, c.want)
+		}
+	}
+}
