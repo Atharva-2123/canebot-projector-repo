@@ -1884,3 +1884,64 @@ func TestMissingSnapshotIsNullNotZero(t *testing.T) {
 		t.Errorf("doorClosed with X0.0 false = %v, want 0", v)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Idle dwell suppression
+// ---------------------------------------------------------------------------
+
+// step_dwells is drowned by one state. On the live machine 1,845,864 of 1,845,948 rows are
+// HomeIdle on a non-production interval — a machine standing still — against 84 rows for
+// everything else combined.
+//
+// The filter is on that state rather than on is_production, and the difference is not
+// academic: nine of those live rows are AutoCycle dwells on intervals with no order row, and
+// they are real machine work. A rule keyed on is_production would drop them too.
+func TestIdleDwellsAreSuppressedButRealWorkIsNot(t *testing.T) {
+	if emitsDwell("HomeIdle", false) {
+		t.Error("HomeIdle on a non-production interval should be dropped — it is 99.995% of the table")
+	}
+	if !emitsDwell("AutoCycle", false) {
+		t.Error("AutoCycle without an order row is still real work and must be kept")
+	}
+	if !emitsDwell("Maintenance", false) {
+		t.Error("Maintenance is the CIP cycle; its step detail is the record of the clean")
+	}
+	if !emitsDwell("Manual", false) {
+		t.Error("Manual is an operator driving the machine, not idling")
+	}
+	if !emitsDwell("HomeIdle", true) {
+		t.Error("HomeIdle inside a production cycle is the machine pausing mid-drink — keep it")
+	}
+}
+
+// End to end: an idle stretch produces cycles and state spans but no step detail, while an
+// AutoCycle stretch with no order row produces all three.
+func TestIdleStretchEmitsNoDwells(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+
+	// 50 idle step runs, no order key.
+	for i := 0; i < 50; i++ {
+		s := base.Add(time.Duration(i) * 10 * time.Second)
+		seedStepRun(t, db, "", "HomeIdle", i%5, s, s.Add(8*time.Second), "HomeIdle", nil, "")
+	}
+	// 10 AutoCycle step runs, also with no order key — real work the machine did.
+	for i := 0; i < 10; i++ {
+		s := base.Add(time.Duration(600+i*10) * time.Second)
+		seedStepRun(t, db, "", "AutoCycle", i, s, s.Add(8*time.Second), "AutoCycle", nil, "")
+	}
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM step_dwells WHERE state='HomeIdle'`); n != 0 {
+		t.Errorf("HomeIdle dwells = %d, want 0", n)
+	}
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM step_dwells WHERE state='AutoCycle'`); n != 10 {
+		t.Errorf("AutoCycle dwells = %d, want 10 — suppressing idle must not touch real work", n)
+	}
+	// The machine time itself is still accounted for; only the step detail is dropped.
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles`); n == 0 {
+		t.Error("no cycles emitted; suppressing dwells must not suppress the intervals")
+	}
+}

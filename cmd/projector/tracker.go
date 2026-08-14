@@ -492,6 +492,25 @@ func sameDwell(d *openDwell, state string, step *int64) bool {
 	}
 }
 
+// emitsDwell reports whether a step dwell is worth keeping.
+//
+// One state drowns this table. On the live machine 1,845,864 of 1,845,948 step_dwells rows
+// are HomeIdle on a non-production interval — 99.995% of the table describing a machine
+// standing still. Everything else together is 84 rows.
+//
+// So the filter is on that state, not on is_production. The distinction matters: nine of
+// those rows are AutoCycle dwells on intervals with no order row, and they are real machine
+// work — the shape the Pi's database actually had. A rule keyed on is_production would drop
+// them along with the idle churn.
+//
+// HomeIdle inside a production cycle is kept: the machine pausing mid-drink is a fact worth
+// having, and there are three such rows, not two million.
+const stateHomeIdle = "HomeIdle"
+
+func emitsDwell(state string, isProduction bool) bool {
+	return isProduction || state != stateHomeIdle
+}
+
 func (t *tracker) closeDwell(lane string, atMS int64) {
 	d := t.openDwells[lane]
 	if d == nil || t.current == nil {
@@ -499,6 +518,11 @@ func (t *tracker) closeDwell(lane string, atMS int64) {
 	}
 	delete(t.openDwells, lane)
 	if atMS <= d.startedMS {
+		return
+	}
+	if !emitsDwell(d.state, t.current.isProduction) {
+		// Dropped here rather than at flush so a long idle stretch does not buffer tens of
+		// thousands of rows in memory first.
 		return
 	}
 	t.current.stepDwells = append(t.current.stepDwells, outStepDwell{
@@ -688,6 +712,12 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 	lane := laneForState(sr.CurrentState)
 	seq := t.dwellSeq[lane]
 	t.dwellSeq[lane] = seq + 1
+
+	if !emitsDwell(sr.CurrentState, iv.isProduction) {
+		// The sequence counter is still advanced above, so seq_index stays a faithful
+		// running position within the lane rather than silently renumbering.
+		return
+	}
 
 	step := sr.Step
 	iv.stepDwells = append(iv.stepDwells, outStepDwell{
