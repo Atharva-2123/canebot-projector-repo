@@ -64,10 +64,14 @@ sqlite-replication:
       strategy: telemetry
       ts_column: event_ts
       include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, is_production, result, outcome, recipe_id, glass_count, terminal_state, terminal_step, fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms, fsm_event_count, step_event_count, state_transition_count, unique_state_count, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, hour_bucket_ms, date_utc]
-    daily_rollups:
+    rollups:
       strategy: telemetry
       ts_column: event_ts
-      include_columns: [id, event_ts, date_utc, recipe_id, glasses, orders_completed, orders_faulted, fault_count, cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms]
+      # One table replaces hourly_rollups, daily_rollups, hourly_fault_counts and
+      # hourly_step_stats: they differed only in grain and in what they grouped by.
+      # Four fewer snapshot cursors is four fewer chances to hit the empty-table skip that
+      # has already cost all of them once.
+      include_columns: [id, event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key, glasses, orders_started, orders_completed, orders_faulted, fault_count, cip_runs, cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms, occurrences, duration_ms_sum, duration_ms_max, severity, lane]
     door_events:
       strategy: telemetry
       ts_column: event_ts
@@ -88,18 +92,6 @@ sqlite-replication:
       strategy: telemetry
       ts_column: event_ts
       include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_key, reason]
-    hourly_fault_counts:
-      strategy: telemetry
-      ts_column: event_ts
-      include_columns: [id, event_ts, bucket_start_ms, date_utc, fault_type, severity, occurrences, downtime_ms_sum]
-    hourly_rollups:
-      strategy: telemetry
-      ts_column: event_ts
-      include_columns: [id, event_ts, bucket_start_ms, date_utc, recipe_id, glasses, orders_started, orders_completed, orders_faulted, fault_count, cip_runs, cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms]
-    hourly_step_stats:
-      strategy: telemetry
-      ts_column: event_ts
-      include_columns: [id, event_ts, bucket_start_ms, date_utc, lane, state, step, dwell_count, duration_ms_sum, duration_ms_max]
     projector_runs:
       strategy: telemetry
       ts_column: event_ts

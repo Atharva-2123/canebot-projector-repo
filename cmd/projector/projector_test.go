@@ -1424,16 +1424,16 @@ func TestHourlyRollupPartitionsThePeriod(t *testing.T) {
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	bucket := hourStart.UnixMilli()
-	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM hourly_rollups WHERE bucket_start_ms=?`, bucket); n != 1 {
-		t.Fatalf("hourly_rollups for the closed bucket = %d, want 1", n)
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM rollups WHERE grain='hour' AND dim_kind='machine' AND bucket_start_ms=?`, bucket); n != 1 {
+		t.Fatalf("machine rollup for the closed bucket = %d, want 1", n)
 	}
 	total := scalarInt(t, rep,
-		`SELECT run_ms + error_ms + maintenance_ms + idle_ms FROM hourly_rollups WHERE bucket_start_ms=?`, bucket)
+		`SELECT run_ms + error_ms + maintenance_ms + idle_ms FROM rollups WHERE grain='hour' AND dim_kind='machine' AND bucket_start_ms=?`, bucket)
 	if total != 3600000 {
 		t.Errorf("run+error+maintenance+idle = %d ms, want 3600000 — the four columns must "+
 			"partition the hour or availability computed from them is wrong", total)
 	}
-	if idle := scalarInt(t, rep, `SELECT idle_ms FROM hourly_rollups WHERE bucket_start_ms=?`, bucket); idle != 3600000 {
+	if idle := scalarInt(t, rep, `SELECT idle_ms FROM rollups WHERE grain='hour' AND dim_kind='machine' AND bucket_start_ms=?`, bucket); idle != 3600000 {
 		t.Errorf("idle_ms = %d, want the whole hour", idle)
 	}
 }
@@ -1451,7 +1451,7 @@ func TestRollupsOnlyCoverClosedBuckets(t *testing.T) {
 	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
 
 	if n := scalarInt(t, rep,
-		`SELECT COUNT(*) FROM hourly_rollups WHERE bucket_start_ms >= ?`, hourStart.UnixMilli()); n != 0 {
+		`SELECT COUNT(*) FROM rollups WHERE grain='hour' AND dim_kind='machine' AND bucket_start_ms >= ?`, hourStart.UnixMilli()); n != 0 {
 		t.Errorf("%d rollup rows for a bucket the timeline has not passed, want 0", n)
 	}
 }
@@ -1472,19 +1472,23 @@ func TestHourlyStepStatsAggregate(t *testing.T) {
 
 	bucket := hourStart.UnixMilli()
 	if n := scalarInt(t, rep,
-		`SELECT dwell_count FROM hourly_step_stats WHERE bucket_start_ms=? AND state='AutoCycle' AND step=10`,
+		`SELECT occurrences FROM rollups WHERE grain='hour' AND dim_kind='step' AND bucket_start_ms=? AND dim_key='AutoCycle/10'`,
 		bucket); n != 3 {
 		t.Errorf("dwell_count = %d, want 3", n)
 	}
 	if max := scalarInt(t, rep,
-		`SELECT duration_ms_max FROM hourly_step_stats WHERE bucket_start_ms=? AND state='AutoCycle' AND step=10`,
+		`SELECT duration_ms_max FROM rollups
+		  WHERE grain='hour' AND dim_kind='step' AND bucket_start_ms=? AND dim_key='AutoCycle/10'`,
 		bucket); max != 3000 {
 		t.Errorf("duration_ms_max = %d, want 3000 (the slowest of the three)", max)
 	}
-	if title := scalarStr(t, rep,
-		`SELECT step_title FROM hourly_step_stats WHERE bucket_start_ms=? AND state='AutoCycle' AND step=10`,
-		bucket); title == "" {
-		t.Error("step_title should come from the firmware's own metadata")
+	// No step_title column on the merged table: dim_key is state/step, and the title is a
+	// pure function of those two — stored once on step_dwells, derived everywhere else.
+	if lane := scalarStr(t, rep,
+		`SELECT lane FROM rollups
+		  WHERE grain='hour' AND dim_kind='step' AND bucket_start_ms=? AND dim_key='AutoCycle/10'`,
+		bucket); lane == "" {
+		t.Error("lane should ride along on a step row so the chart can group without a join")
 	}
 }
 
@@ -1499,14 +1503,14 @@ func TestRollupsAreNotDuplicatedOnRerun(t *testing.T) {
 	seedTransition(t, db, "", "HomeIdle", "AutoCycle", hourStart.Add(90*time.Minute))
 
 	first := runOnce(t, sourcePath, dir)
-	before := scalarInt(t, openRO(t, first), `SELECT COUNT(*) FROM hourly_rollups`)
+	before := scalarInt(t, openRO(t, first), `SELECT COUNT(*) FROM rollups WHERE grain='hour' AND dim_kind='machine'`)
 	if before == 0 {
 		t.Fatal("expected at least one rollup row")
 	}
 	second := runOnce(t, sourcePath, dir)
-	after := scalarInt(t, openRO(t, second), `SELECT COUNT(*) FROM hourly_rollups`)
+	after := scalarInt(t, openRO(t, second), `SELECT COUNT(*) FROM rollups WHERE grain='hour' AND dim_kind='machine'`)
 	if after != before {
-		t.Errorf("hourly_rollups %d -> %d across runs; the bucket cursor should prevent re-emission",
+		t.Errorf("machine rollups %d -> %d across runs; the bucket cursor should prevent re-emission",
 			before, after)
 	}
 }
@@ -1943,5 +1947,93 @@ func TestIdleStretchEmitsNoDwells(t *testing.T) {
 	// The machine time itself is still accounted for; only the step detail is dropped.
 	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles`); n == 0 {
 		t.Error("no cycles emitted; suppressing dwells must not suppress the intervals")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The merged rollups table
+// ---------------------------------------------------------------------------
+
+// Four tables became one, distinguished by grain and dimension. The day grain is the reason
+// the merge was worth doing: a 90-day window at hourly grain is 2,160 rows against the
+// platform's hard 1,000-row query cap, so it fails outright rather than degrading.
+func TestRollupsCarryBothGrainsAndDimensions(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	seedCompletedCycle(t, db, "ORD-roll01", base)
+	seedFault(t, db, "ORD-roll01", "CrusherMotorFault", 4, base.Add(5*time.Second))
+	// Push the clock past the day boundary so both the hour and the day close.
+	seedTransition(t, db, "", "AutoCycle", "HomeIdle", base.Add(30*time.Hour))
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	for _, c := range []struct{ name, where string }{
+		{"machine hour", `grain='hour' AND dim_kind='machine'`},
+		{"machine day", `grain='day' AND dim_kind='machine'`},
+		{"fault type", `grain='hour' AND dim_kind='fault_type'`},
+	} {
+		if n := scalarInt(t, rep, `SELECT COUNT(*) FROM rollups WHERE `+c.where); n == 0 {
+			t.Errorf("no %s rows in rollups", c.name)
+		}
+	}
+
+	// A machine row is the whole machine for that bucket, so it has no dimension key.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM rollups WHERE dim_kind='machine' AND dim_key IS NOT NULL`); n != 0 {
+		t.Errorf("%d machine rows carry a dim_key; they describe the whole machine", n)
+	}
+	// A dimensional row without its key cannot be grouped by anything.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM rollups WHERE dim_kind<>'machine' AND dim_key IS NULL`); n != 0 {
+		t.Errorf("%d dimensional rows have no dim_key", n)
+	}
+
+	// The day must agree with the hours inside it: every measure is additive, which is what
+	// lets the dashboard re-aggregate instead of asking for a third grain.
+	dayGlasses := scalarInt(t, rep,
+		`SELECT COALESCE(SUM(glasses),0) FROM rollups WHERE grain='day' AND dim_kind='machine'`)
+	hourGlasses := scalarInt(t, rep,
+		`SELECT COALESCE(SUM(glasses),0) FROM rollups WHERE grain='hour' AND dim_kind='machine'`)
+	if dayGlasses != hourGlasses {
+		t.Errorf("day glasses = %d but hours sum to %d; the grains must agree",
+			dayGlasses, hourGlasses)
+	}
+}
+
+// An existing replica is migrated by copying rows across, not by re-deriving them: the source
+// rows behind old buckets may already have been pruned from the controller.
+func TestOldRollupTablesAreFoldedIn(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	dir := t.TempDir()
+	seedCompletedCycle(t, db, "ORD-fold01", base)
+	replica := runOnce(t, sourcePath, dir)
+
+	// Rebuild the pre-merge shape and put a row in it that exists nowhere else.
+	rw, err := sql.Open("sqlite", "file:"+replica)
+	if err != nil {
+		t.Fatalf("open replica rw: %v", err)
+	}
+	mustExec(t, rw, `CREATE TABLE hourly_rollups (
+		id INTEGER PRIMARY KEY, event_ts TEXT NOT NULL, bucket_start_ms INTEGER NOT NULL,
+		date_utc TEXT NOT NULL, recipe_id INTEGER, glasses INTEGER, orders_started INTEGER,
+		orders_completed INTEGER, orders_faulted INTEGER, fault_count INTEGER, cip_runs INTEGER,
+		cycle_ms_sum INTEGER, cycle_count INTEGER, run_ms INTEGER, error_ms INTEGER,
+		maintenance_ms INTEGER, idle_ms INTEGER)`)
+	mustExec(t, rw, `INSERT INTO hourly_rollups
+		(event_ts, bucket_start_ms, date_utc, glasses, orders_completed)
+		VALUES ('2026-01-01T00:00:00.000000000Z', 1767225600000, '2026-01-01', 7, 7)`)
+	rw.Close()
+
+	replica = runOnce(t, sourcePath, dir)
+	rep := openRO(t, replica)
+
+	if g := scalarInt(t, rep,
+		`SELECT glasses FROM rollups
+		  WHERE grain='hour' AND dim_kind='machine' AND bucket_start_ms=1767225600000`); g != 7 {
+		t.Errorf("migrated glasses = %d, want 7 — history predating the merge must survive it", g)
+	}
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hourly_rollups'`); n != 0 {
+		t.Error("hourly_rollups still exists; a table the projector no longer writes would " +
+			"keep its replication cursor and look like a live but frozen feed")
 	}
 }

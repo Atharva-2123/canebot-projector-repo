@@ -343,14 +343,31 @@ CREATE TABLE IF NOT EXISTS config_history (
     date_utc       TEXT    NOT NULL
 );
 
--- ═══════════ rollups — every column additive, so buckets re-aggregate ═══════════
-
-CREATE TABLE IF NOT EXISTS hourly_rollups (
+-- ═══════════ rollups — pre-aggregated, two axes ═══════════
+--
+-- One table replaces hourly_rollups, daily_rollups, hourly_fault_counts and
+-- hourly_step_stats. They differed only in their grain and in what they were grouped by, so
+-- they are now grain and (dim_kind, dim_key) on a single table.
+--
+-- Fewer tables is not cosmetic here: every table is one more omega snapshot cursor, and a
+-- table created empty and populated later is silently skipped by the agent — a failure that
+-- has already cost all four of these once.
+--
+-- EVERY measure is additive: sums and counts, divided at render time, never a stored average.
+-- That is what lets an hour re-aggregate into a day, and a day into a quarter.
+--
+-- The in-progress bucket has no row by design. Render it as pending, never as zero.
+CREATE TABLE IF NOT EXISTS rollups (
     id               INTEGER PRIMARY KEY,
     event_ts         TEXT    NOT NULL,         -- bucket end
+    grain            TEXT    NOT NULL,         -- hour | day
     bucket_start_ms  INTEGER NOT NULL,
     date_utc         TEXT    NOT NULL,
-    recipe_id        INTEGER,
+    dim_kind         TEXT    NOT NULL,         -- machine | fault_type | step | recipe | sensor
+    dim_key          TEXT,                     -- NULL for machine; else the fault type,
+                                               -- step, recipe id or input_id
+
+    -- machine measures (dim_kind = 'machine')
     glasses          INTEGER,
     orders_started   INTEGER,
     orders_completed INTEGER,
@@ -362,50 +379,20 @@ CREATE TABLE IF NOT EXISTS hourly_rollups (
     run_ms           INTEGER,
     error_ms         INTEGER,
     maintenance_ms   INTEGER,
-    idle_ms          INTEGER
+    idle_ms          INTEGER,
+
+    -- dimensional measures (dim_kind <> 'machine')
+    occurrences      INTEGER,
+    duration_ms_sum  INTEGER,
+    duration_ms_max  INTEGER,
+    severity         TEXT,                     -- fault_type rows only
+    lane             TEXT,                     -- step rows only
+
+    UNIQUE(grain, bucket_start_ms, dim_kind, dim_key)
 );
 
-CREATE TABLE IF NOT EXISTS hourly_fault_counts (
-    id              INTEGER PRIMARY KEY,
-    event_ts        TEXT    NOT NULL,
-    bucket_start_ms INTEGER NOT NULL,
-    date_utc        TEXT    NOT NULL,
-    fault_type      TEXT    NOT NULL,
-    severity        TEXT    NOT NULL,
-    occurrences     INTEGER NOT NULL,
-    downtime_ms_sum INTEGER
-);
 
-CREATE TABLE IF NOT EXISTS hourly_step_stats (
-    id              INTEGER PRIMARY KEY,
-    event_ts        TEXT    NOT NULL,
-    bucket_start_ms INTEGER NOT NULL,
-    date_utc        TEXT    NOT NULL,
-    lane            TEXT    NOT NULL,
-    state           TEXT    NOT NULL,
-    step            INTEGER,
-    step_title      TEXT,
-    dwell_count     INTEGER NOT NULL,
-    duration_ms_sum INTEGER NOT NULL,
-    duration_ms_max INTEGER NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS daily_rollups (
-    id               INTEGER PRIMARY KEY,
-    event_ts         TEXT    NOT NULL,
-    date_utc         TEXT    NOT NULL,
-    recipe_id        INTEGER,
-    glasses          INTEGER,
-    orders_completed INTEGER,
-    orders_faulted   INTEGER,
-    fault_count      INTEGER,
-    cycle_ms_sum     INTEGER,
-    cycle_count      INTEGER,
-    run_ms           INTEGER,
-    error_ms         INTEGER,
-    maintenance_ms   INTEGER,
-    idle_ms          INTEGER
-);
 
 -- ═══════════ collector health ═══════════
 
@@ -458,10 +445,7 @@ CREATE INDEX IF NOT EXISTS idx_fsm_events_order       ON fsm_events(order_key, e
 CREATE INDEX IF NOT EXISTS idx_sensor_toggles_ts      ON sensor_toggles(event_ts);
 CREATE INDEX IF NOT EXISTS idx_sensor_toggles_order   ON sensor_toggles(order_key, event_at_ms);
 CREATE INDEX IF NOT EXISTS idx_config_history_order   ON config_history(order_key);
-CREATE INDEX IF NOT EXISTS idx_hourly_rollups_bucket  ON hourly_rollups(bucket_start_ms);
-CREATE INDEX IF NOT EXISTS idx_hourly_faults_bucket   ON hourly_fault_counts(bucket_start_ms, fault_type);
-CREATE INDEX IF NOT EXISTS idx_hourly_steps_bucket    ON hourly_step_stats(bucket_start_ms, lane, step);
-CREATE INDEX IF NOT EXISTS idx_daily_rollups_date     ON daily_rollups(date_utc);
+CREATE INDEX IF NOT EXISTS idx_rollups_lookup          ON rollups(grain, dim_kind, bucket_start_ms);
 `
 
 // stateSchema is projector_state.db — the projector's own bookkeeping.

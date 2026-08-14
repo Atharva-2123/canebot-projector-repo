@@ -34,6 +34,28 @@ const (
 // emitDerived writes everything that can be derived from already-flushed rows. upToMS is the
 // furthest point on the timeline actually processed — never wall-clock now, which would sit
 // ahead of the data and finalise buckets we have not filled yet.
+// The two axes of the rollups table. Grain is how wide the bucket is; dim_kind is what the
+// row is grouped by. A machine row has no dim_key — it IS the whole machine for that bucket.
+const (
+	grainHour = "hour"
+	grainDay  = "day"
+
+	dimMachine   = "machine"
+	dimFaultType = "fault_type"
+	dimStep      = "step"
+	dimRecipe    = "recipe"
+	dimSensor    = "sensor"
+)
+
+// stepDimKey identifies a step across states, since step 10 of AutoCycle and step 10 of
+// Maintenance are different work. The lane rides along in its own column for display.
+func stepDimKey(state string, step *int64) string {
+	if step == nil {
+		return state
+	}
+	return fmt.Sprintf("%s/%d", state, *step)
+}
+
 func (p *projector) emitDerived(ctx context.Context, upToMS int64) error {
 	if upToMS <= 0 {
 		return nil
@@ -228,12 +250,13 @@ func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error
 	// that run/error/maintenance/idle sum to the period. Per-recipe figures come from `cycles`,
 	// which carries recipe_id and is replicated.
 	if _, err := p.rep.db.ExecContext(ctx,
-		`INSERT INTO hourly_rollups (event_ts, bucket_start_ms, date_utc, recipe_id,
-		                             glasses, orders_started, orders_completed, orders_faulted,
-		                             fault_count, cip_runs, cycle_ms_sum, cycle_count,
-		                             run_ms, error_ms, maintenance_ms, idle_ms)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		ts, bucketStart, dateUTC(bucketStart), nil,
+		`INSERT INTO rollups (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		                      glasses, orders_started, orders_completed, orders_faulted,
+		                      fault_count, cip_runs, cycle_ms_sum, cycle_count,
+		                      run_ms, error_ms, maintenance_ms, idle_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
+		ts, grainHour, bucketStart, dateUTC(bucketStart), dimMachine, nil,
 		agg.glasses, agg.started, agg.completed, agg.faulted,
 		faultCount, cipCount, agg.cycleMS, agg.cycleCount,
 		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,
@@ -281,10 +304,12 @@ func (p *projector) emitHourlyFaultCounts(ctx context.Context, bucketStart int64
 
 	for _, r := range out {
 		if _, err := p.rep.db.ExecContext(ctx,
-			`INSERT INTO hourly_fault_counts (event_ts, bucket_start_ms, date_utc,
-			                                  fault_type, severity, occurrences, downtime_ms_sum)
-			 VALUES (?,?,?,?,?,?,?)`,
-			ts, bucketStart, dateUTC(bucketStart), r.faultType, r.severity, r.occurrences, r.downtime,
+			`INSERT INTO rollups (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+			                      severity, occurrences, duration_ms_sum)
+			 VALUES (?,?,?,?,?,?,?,?,?)
+			 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
+			ts, grainHour, bucketStart, dateUTC(bucketStart), dimFaultType, r.faultType,
+			r.severity, r.occurrences, r.downtime,
 		); err != nil {
 			return fmt.Errorf("insert hourly_fault_count: %w", err)
 		}
@@ -330,19 +355,19 @@ func (p *projector) emitHourlyStepStats(ctx context.Context, bucketStart int64, 
 
 	for _, r := range out {
 		var stepPtr *int64
-		var title any
 		if r.step.Valid {
 			v := r.step.Int64
 			stepPtr = &v
-			title = nullIfEmpty(stepTitle(r.state, &v))
 		}
+		// No step_title column here: dim_key carries state/step, and the title is a pure
+		// function of the two — the same reason it is derived rather than stored elsewhere.
 		if _, err := p.rep.db.ExecContext(ctx,
-			`INSERT INTO hourly_step_stats (event_ts, bucket_start_ms, date_utc,
-			                                lane, state, step, step_title,
-			                                dwell_count, duration_ms_sum, duration_ms_max)
-			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-			ts, bucketStart, dateUTC(bucketStart), r.lane, r.state, stepPtr, title,
-			r.count, r.sum, r.ms,
+			`INSERT INTO rollups (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+			                      lane, occurrences, duration_ms_sum, duration_ms_max)
+			 VALUES (?,?,?,?,?,?,?,?,?,?)
+			 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
+			ts, grainHour, bucketStart, dateUTC(bucketStart), dimStep, stepDimKey(r.state, stepPtr),
+			r.lane, r.count, r.sum, r.ms,
 		); err != nil {
 			return fmt.Errorf("insert hourly_step_stat: %w", err)
 		}
@@ -407,12 +432,13 @@ func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
 		return err
 	}
 	if _, err := p.rep.db.ExecContext(ctx,
-		`INSERT INTO daily_rollups (event_ts, date_utc, recipe_id, glasses,
-		                            orders_completed, orders_faulted, fault_count,
-		                            cycle_ms_sum, cycle_count,
-		                            run_ms, error_ms, maintenance_ms, idle_ms)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		ts, date, nil, agg.glasses,
+		`INSERT INTO rollups (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		                      glasses, orders_completed, orders_faulted, fault_count,
+		                      cycle_ms_sum, cycle_count,
+		                      run_ms, error_ms, maintenance_ms, idle_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
+		ts, grainDay, dayStart, date, dimMachine, nil, agg.glasses,
 		agg.completed, agg.faulted, faultCount,
 		agg.cycleMS, agg.cycleCount,
 		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,

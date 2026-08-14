@@ -383,6 +383,18 @@ func migrateReplica(db *sql.DB) error {
 		}
 	}
 
+	// The four rollup tables became one. An existing replica is migrated by copying its rows
+	// across, not by dropping and re-deriving: the source rows behind old buckets may already
+	// have been pruned from the controller, so a re-derivation would silently lose history.
+	//
+	// The copy runs in the same step that creates the table, which also sidesteps the agent
+	// bug that has already cost these four tables once — a table created empty and populated
+	// later is skipped, its cursor fast-forwarded past everything that arrives afterwards.
+	// Created-and-populated in one go, there is no empty window to observe.
+	if err := migrateRollups(db); err != nil {
+		return err
+	}
+
 	for _, m := range migrations {
 		has, err := replicaHasColumn(db, m.table, m.column)
 		if err != nil {
@@ -400,6 +412,76 @@ func migrateReplica(db *sql.DB) error {
 		if _, err := db.Exec(m.backfill); err != nil {
 			return fmt.Errorf("backfill replica %s.%s: %w", m.table, m.column, err)
 		}
+	}
+	return nil
+}
+
+// migrateRollups folds hourly_rollups, daily_rollups, hourly_fault_counts and
+// hourly_step_stats into the single rollups table.
+//
+// Each source is checked for independently rather than assuming all four are present. That is
+// not defensive padding: the agent bug in §11 has already left one of these tables missing
+// from a live deployment, so "hourly_rollups exists" says nothing about the other three.
+func migrateRollups(db *sql.DB) error {
+	copies := []struct{ from, sql string }{
+		{"hourly_rollups", `INSERT OR IGNORE INTO rollups
+		     (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		      glasses, orders_started, orders_completed, orders_faulted, fault_count, cip_runs,
+		      cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms)
+		 SELECT event_ts, 'hour', bucket_start_ms, date_utc, 'machine', NULL,
+		      glasses, orders_started, orders_completed, orders_faulted, fault_count, cip_runs,
+		      cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms
+		 FROM hourly_rollups`},
+
+		{"daily_rollups", `INSERT OR IGNORE INTO rollups
+		     (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		      glasses, orders_completed, orders_faulted, fault_count,
+		      cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms)
+		 SELECT event_ts, 'day', CAST(strftime('%s', date_utc) AS INTEGER) * 1000, date_utc,
+		      'machine', NULL,
+		      glasses, orders_completed, orders_faulted, fault_count,
+		      cycle_ms_sum, cycle_count, run_ms, error_ms, maintenance_ms, idle_ms
+		 FROM daily_rollups`},
+
+		{"hourly_fault_counts", `INSERT OR IGNORE INTO rollups
+		     (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		      severity, occurrences, duration_ms_sum)
+		 SELECT event_ts, 'hour', bucket_start_ms, date_utc, 'fault_type', fault_type,
+		      severity, occurrences, downtime_ms_sum
+		 FROM hourly_fault_counts`},
+
+		{"hourly_step_stats", `INSERT OR IGNORE INTO rollups
+		     (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
+		      lane, occurrences, duration_ms_sum, duration_ms_max)
+		 SELECT event_ts, 'hour', bucket_start_ms, date_utc, 'step',
+		      CASE WHEN step IS NULL THEN state ELSE state || '/' || step END,
+		      lane, dwell_count, duration_ms_sum, duration_ms_max
+		 FROM hourly_step_stats`},
+	}
+
+	migrated := 0
+	for _, c := range copies {
+		var exists int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, c.from,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("probe %s: %w", c.from, err)
+		}
+		if exists == 0 {
+			continue
+		}
+		if _, err := db.Exec(c.sql); err != nil {
+			return fmt.Errorf("migrate %s into rollups: %w", c.from, err)
+		}
+		// Dropped rather than left behind: a table the projector no longer writes would keep
+		// its replication cursor and look like a live feed that has simply gone quiet.
+		if _, err := db.Exec(`DROP TABLE ` + c.from); err != nil {
+			return fmt.Errorf("drop %s: %w", c.from, err)
+		}
+		migrated++
+	}
+	if migrated > 0 {
+		log.Printf("projector: folded %d rollup table(s) into rollups", migrated)
 	}
 	return nil
 }
