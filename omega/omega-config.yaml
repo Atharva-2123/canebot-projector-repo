@@ -95,18 +95,23 @@ sqlite-replication:
     step_dwells:
       strategy: telemetry
       ts_column: event_ts
-      # step_title now ships: it is a few hundred distinct strings repeated across every
-      # row, which compresses to almost nothing, and withholding it forced the dashboard to
-      # keep its own copy of the firmware's step map — a copy that drifts the first time a
-      # step is renamed.
+      # step_title SHIPS. It is a few hundred distinct strings repeated across every row, so
+      # it compresses to almost nothing, and withholding it forced the dashboard to keep its
+      # own copy of the firmware's step map — a copy that drifts the first time a step is
+      # renamed.
       #
-      # Deliberately NOT shipped, though the replica keeps them all:
+      # sensors_start_bits / sensors_end_bits also ship, and are now the ONLY sensor state
+      # reaching the cloud: fsm_events, which used to carry it, is no longer replicated.
+      # door_closed and cip_bypass are the two documented inputs lifted out of the bit string,
+      # because a query cannot index into one.
+      #
+      # Deliberately NOT shipped, though the replica keeps them for local inspection:
       #   sensors_start_json / sensors_end_json  ~820 B/row and identical on 99.7% of rows;
-      #                                          fsm_events.sensors_bits carries sensor state
-      #   sensors_trace_json / actuators_json    empty on nearly every row; step_actuators
-      #                                          already carries the flattened actuator data
-      #   step_title                             derived client-side from (state, step) via
-      #                                          fsm-step-metadata.ts getStepTitle()
-      # Together these were ~95% of the row. Without them omega outruns the projector instead
-      # of falling further behind it.
+      #                                          the *_bits columns carry the same 32 booleans
+      #   actuators_json                         the per-output breakdown, kept verbatim on
+      #                                          the dwell; actuator_intervals holds every
+      #                                          pulse individually and is what to query
+      #
+      # Together those were ~95% of the row. Without holding them back omega falls further
+      # behind the projector rather than draining its backlog.
       include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, lane, state, step, step_title, seq_index, previous_state, previous_step, event_count, io_event_count, transition_count, fault_count, sensors_start_bits, sensors_end_bits, door_closed, cip_bypass, source_kind, fault_type, fault_message, recipe_id, is_production, cycle_result, cycle_started_at_ms, bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc]
