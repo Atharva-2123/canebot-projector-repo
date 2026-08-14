@@ -1610,3 +1610,89 @@ func TestSensorBitsBackfill(t *testing.T) {
 		t.Errorf("backfill rewrote an already-filled row: %q", after)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Late-arriving orders row
+// ---------------------------------------------------------------------------
+
+// The firmware writes the orders row when it consumes the order, and writes the FSM rows
+// as the cycle runs. Those are separate tables with separate read cursors, so nothing
+// guarantees the projector sees the orders row in the same tick as the events — and if a
+// table returns zero rows this pass, it contributes no clamp to safeUpTo.
+//
+// When that happens the cycle is written from the events alone, with recipe_id and
+// glass_count null. The orders row then arrives, ApplyOrder reopens the interval, and the
+// insert hits ON CONFLICT(order_key) DO NOTHING — so the recipe is dropped on the floor
+// and never recoverable, because cycles is immutable after the first write.
+//
+// This is the shape of the production symptom: recipe_id and glass_count null on every
+// replicated row while the cycles themselves look correct.
+func TestRecipeArrivesAfterTheCycleWasWritten(t *testing.T) {
+	// The base branch, so dwells are derived from fsm_events and the child backfill below
+	// has rows to act on. The bug itself is branch-independent: both branches read `orders`
+	// through its own cursor.
+	sourcePath, db := newBaseSourceDB(t)
+	dir := t.TempDir()
+
+	// Tick 1: the cycle runs to completion, but the orders row is not visible yet.
+	for i := 0; i < autoCycleCompleteStep; i++ {
+		seedStep(t, db, "ORD-late01", "AutoCycle", i, i+1, base.Add(time.Duration(i+1)*time.Second))
+	}
+	runOnce(t, sourcePath, dir)
+
+	// Tick 2: the orders row lands.
+	seedOrder(t, db, "ORD-late01", 4, base)
+	replica := runOnce(t, sourcePath, dir)
+
+	rep := openRO(t, replica)
+
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-late01'`); n != 1 {
+		t.Fatalf("cycles rows = %d, want exactly 1 (order_key is unique)", n)
+	}
+
+	var recipe, glass sql.NullInt64
+	err := rep.QueryRow(
+		`SELECT recipe_id, glass_count FROM cycles WHERE order_key='ORD-late01'`,
+	).Scan(&recipe, &glass)
+	if err != nil {
+		t.Fatalf("read cycle: %v", err)
+	}
+
+	if !recipe.Valid || recipe.Int64 != 4 {
+		t.Errorf("recipe_id = %v, want 4 — the orders row arrived after the cycle was written "+
+			"and was discarded by ON CONFLICT DO NOTHING", recipe)
+	}
+	if !glass.Valid || glass.Int64 != 1 {
+		t.Errorf("glass_count = %v, want 1", glass)
+	}
+
+	// The children denormalise recipe_id so the dashboard never joins. They were written
+	// in the first tick, before the recipe was known, so filling only the parent would
+	// leave a cycle whose own dwells disagree with it.
+	if r := scalarInt(t, rep,
+		`SELECT COALESCE(recipe_id, -1) FROM step_dwells WHERE order_key='ORD-late01' LIMIT 1`); r != 4 {
+		t.Errorf("step_dwells.recipe_id = %d, want 4 (backfilled from the late orders row)", r)
+	}
+}
+
+// The backfill must never overwrite a value already recorded, or a re-derivation could
+// replace good data with a null from an interval that happened not to carry it.
+func TestBackfillNeverOverwritesAnExistingRecipe(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	dir := t.TempDir()
+
+	seedCompletedCycle(t, db, "ORD-keep01", base) // seeds recipe 3
+	runOnce(t, sourcePath, dir)
+
+	// Run again over the same source: every interval is re-derived and re-flushed.
+	replica := runOnce(t, sourcePath, dir)
+	rep := openRO(t, replica)
+
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_key='ORD-keep01'`); n != 1 {
+		t.Fatalf("cycles rows = %d, want exactly 1", n)
+	}
+	if r := scalarInt(t, rep,
+		`SELECT COALESCE(recipe_id, -1) FROM cycles WHERE order_key='ORD-keep01'`); r != 3 {
+		t.Errorf("recipe_id = %d, want 3 — a re-run must not disturb a settled value", r)
+	}
+}

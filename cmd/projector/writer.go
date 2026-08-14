@@ -431,7 +431,9 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		                     fsm_event_count, step_event_count, state_transition_count,
 		                     unique_state_count, hour_bucket_ms, date_utc)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		 ON CONFLICT(order_key) DO NOTHING`,
+		 ON CONFLICT(order_key) DO UPDATE SET
+		     recipe_id   = COALESCE(cycles.recipe_id,   excluded.recipe_id),
+		     glass_count = COALESCE(cycles.glass_count, excluded.glass_count)`,
 		cycleTS, iv.startedMS, iv.endedMS, iv.endedMS-iv.startedMS, iv.orderKey,
 		prod, iv.result, iv.recipeID, iv.glassCount,
 		nullIfEmpty(iv.terminalState), iv.terminalStep,
@@ -440,6 +442,31 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		hourBucket(iv.startedMS), dateUTC(iv.startedMS),
 	); err != nil {
 		return fmt.Errorf("insert cycle %s: %w", iv.orderKey, err)
+	}
+
+	// Fill the order metadata into the children that denormalise it.
+	//
+	// `orders` and the FSM tables have independent read cursors, so the row carrying
+	// recipe and quantity can arrive after the cycle it describes was already written and
+	// closed. The conflict clause above fills the parent; without this the children keep
+	// the null they were written with, and the dashboard sees a cycle with a recipe whose
+	// own dwells and faults disagree.
+	//
+	// Only ever fills a null — a value already recorded is never overwritten, so this stays
+	// idempotent across re-runs and cannot corrupt settled rows.
+	if iv.recipeID != nil || iv.glassCount != nil {
+		for _, child := range []string{
+			"step_dwells", "step_actuators", "fault_events", "door_events", "actuator_intervals",
+		} {
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf(
+					`UPDATE %s SET recipe_id = ? WHERE order_key = ? AND recipe_id IS NULL`,
+					child),
+				iv.recipeID, iv.orderKey,
+			); err != nil {
+				return fmt.Errorf("backfill %s.recipe_id for %s: %w", child, iv.orderKey, err)
+			}
+		}
 	}
 
 	maxTS := cycleTS
