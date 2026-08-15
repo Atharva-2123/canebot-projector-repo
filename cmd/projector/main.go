@@ -562,8 +562,27 @@ func (p *projector) drainActuators(ctx context.Context) error {
 
 // finalFlush closes the in-progress interval and writes it. Used at shutdown and at the end
 // of a -once run.
+//
+// The interval is closed on the machine's timeline, not at wall-clock now — the same rule
+// emitDerived already follows, and for a sharper reason.
+//
+// During a backfill the newest source row can be weeks old. Closing the open interval at "now"
+// stamps it with a wall-clock event_ts, which raises the cycles watermark to now; every interval
+// written after that is earlier, so the monotonic guard clamps it forward. One -once run over
+// historical data is enough to collapse the entire history onto the instant the projector ran,
+// and because the watermark is persisted, it never recovers. Every dashboard panel filters on
+// event_ts, so the effect is a month of production appearing as a single spike today.
+//
+// The cost is that a genuinely idle stretch between the last source event and shutdown is not
+// counted as idle time. That is the trade already accepted for the rollups, and `gaps` reports
+// the uncovered period explicitly rather than letting it read as machine idleness.
 func (p *projector) finalFlush(ctx context.Context) error {
-	p.trk.FlushOpen(time.Now().UnixMilli())
+	closeAt := p.lastTimelineMS
+	if now := time.Now().UnixMilli(); closeAt == 0 || closeAt > now {
+		// No timeline yet (nothing has been applied), or a source clock ahead of ours.
+		closeAt = now
+	}
+	p.trk.FlushOpen(closeAt)
 	if err := p.flushIntervals(ctx); err != nil {
 		return err
 	}

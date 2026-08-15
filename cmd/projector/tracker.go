@@ -927,9 +927,19 @@ func (t *tracker) ApplyConfigChange(key, oldVal, newVal string, at time.Time) {
 // FlushOpen force-closes the interval still in progress. Called when the process is shutting
 // down or a -once run is ending, so buffered work is written rather than discarded. The row
 // is marked as force-closed via its result so downstream can tell it apart from a natural end.
+// FlushOpen closes the in-progress interval at atMS.
+//
+// atMS is floored to just past the interval's start. The caller closes on the machine's
+// timeline rather than wall-clock now (see finalFlush), and a tick whose only applied row is the
+// one that opened this interval leaves the two equal — which closeInterval treats as
+// zero-length and drops. Dropping it loses the row entirely, and with it the late-arriving
+// `orders` fill that the ON CONFLICT in FlushInterval exists to apply.
 func (t *tracker) FlushOpen(atMS int64) {
 	if t.current == nil {
 		return
+	}
+	if atMS <= t.current.startedMS {
+		atMS = t.current.startedMS + 1
 	}
 	forced := t.current.result
 	if t.current.isProduction {

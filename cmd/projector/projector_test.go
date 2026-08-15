@@ -1939,6 +1939,45 @@ func TestRollupsCarryBothGrainsAndDimensions(t *testing.T) {
 	}
 }
 
+// A backfill must not stamp historical rows with the wall-clock time of the run.
+//
+// finalFlush closes the in-progress interval at the end of every -once run. Closing it at "now"
+// gives it a wall-clock event_ts, which raises the cycles watermark to now — and then the
+// monotonic guard clamps every historical interval written afterwards forward to that same
+// instant. Because the watermark is persisted, one such run poisons the replica permanently.
+//
+// The symptom on the dashboard is total: every panel filters on event_ts, so a month of
+// production collapses onto the moment the projector happened to run.
+func TestBackfillDoesNotStampHistoryWithWallClock(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	dir := t.TempDir()
+
+	// Two days of history, seeded a run apart so the second run has to write rows that are
+	// older than anything the first run left behind.
+	seedCompletedCycle(t, db, "ORD-hist01", base)
+	runOnce(t, sourcePath, dir)
+
+	seedCompletedCycle(t, db, "ORD-hist02", base.Add(24*time.Hour))
+	seedTransition(t, db, "", "AutoCycle", "HomeIdle", base.Add(25*time.Hour))
+	replica := runOnce(t, sourcePath, dir)
+
+	rep := openRO(t, replica)
+
+	// date_utc comes from the interval's own start and is never clamped, so the two columns
+	// disagreeing is exactly the signature of a wall-clock stamp.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM cycles WHERE substr(event_ts, 1, 10) <> date_utc`); n != 0 {
+		t.Errorf("%d cycles carry an event_ts from a different day than they happened on", n)
+	}
+
+	// And state it directly: nothing may be stamped after the newest source row.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM cycles WHERE event_ts > ?`,
+		srcTime(base.Add(26*time.Hour))); n != 0 {
+		t.Errorf("%d cycles are stamped past the end of the source data", n)
+	}
+}
+
 // An existing replica is migrated by copying rows across, not by re-deriving them: the source
 // rows behind old buckets may already have been pruned from the controller.
 func TestOldRollupTablesAreFoldedIn(t *testing.T) {
