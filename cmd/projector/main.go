@@ -83,17 +83,51 @@ func main() {
 		retention   = flag.Duration("retention", 14*24*time.Hour, "how long to keep rows in the replica")
 		once        = flag.Bool("once", false, "run a single pass and exit (useful for tests and backfill)")
 		verboseFlag = flag.Bool("v", false, "verbose logging")
+
+		fsmLog          = flag.String("fsm-log", "", "controller stdout log to tail into fsm_logs (empty: off, and the table is never created)")
+		fsmLogRetention = flag.Duration("fsm-log-retention", 48*time.Hour, "delete fsm_logs rows older than this once omega has delivered them")
+		fsmLogMaxAge    = flag.Duration("fsm-log-max-age", 7*24*time.Hour, "delete fsm_logs rows older than this whether delivered or not")
+		fsmLogOmega     = flag.String("fsm-log-omega-state", "", "state db of the omega whose delivery allows -fsm-log-retention (empty: only -fsm-log-max-age applies)")
+		fsmLogDigest    = flag.Duration("fsm-log-digest", time.Minute, "collapse a line repeating within this window into one row (0: keep every line)")
 	)
 	flag.Parse()
 	verbose = *verboseFlag
 
-	if err := run(*sourcePath, *replicaPath, *statePath, *interval, *batchSize, *retention, *once); err != nil {
+	if err := runWith(options{
+		sourcePath: *sourcePath, replicaPath: *replicaPath, statePath: *statePath,
+		interval: *interval, batchSize: *batchSize, retention: *retention, once: *once,
+		fsmLogPath: *fsmLog, fsmLogRetention: *fsmLogRetention, fsmLogMaxAge: *fsmLogMaxAge,
+		fsmLogOmegaState: *fsmLogOmega, fsmLogDigest: *fsmLogDigest,
+	}); err != nil {
 		log.Fatalf("projector: %v", err)
 	}
 }
 
+type options struct {
+	sourcePath, replicaPath, statePath string
+	interval                           time.Duration
+	batchSize                          int
+	retention                          time.Duration
+	once                               bool
+
+	fsmLogPath       string
+	fsmLogRetention  time.Duration
+	fsmLogMaxAge     time.Duration
+	fsmLogOmegaState string
+	fsmLogDigest     time.Duration
+}
+
 func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 	batchSize int, retention time.Duration, once bool) error {
+	return runWith(options{
+		sourcePath: sourcePath, replicaPath: replicaPath, statePath: statePath,
+		interval: interval, batchSize: batchSize, retention: retention, once: once,
+	})
+}
+
+func runWith(o options) error {
+	sourcePath, replicaPath, statePath := o.sourcePath, o.replicaPath, o.statePath
+	interval, batchSize, retention, once := o.interval, o.batchSize, o.retention, o.once
 
 	if _, err := os.Stat(sourcePath); err != nil {
 		return fmt.Errorf("source database %s: %w", sourcePath, err)
@@ -167,13 +201,26 @@ func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 		}
 	}
 
+	// The log tail runs beside the tick, never inside it: it shares nothing with the timeline
+	// merge, and a failing tail must not hold back the heartbeat and invent a gap.
+	var tail *logTailer
+	if o.fsmLogPath != "" {
+		tail = newLogTailer(o.fsmLogPath, rep, st, o.fsmLogDigest)
+	}
+
 	if once {
 		if err := p.tick(ctx); err != nil {
 			return err
 		}
 		// A single pass would otherwise leave the in-progress interval buffered in memory
 		// and write nothing at all for a machine that never changed state.
-		return p.finalFlush(ctx)
+		if err := p.finalFlush(ctx); err != nil {
+			return err
+		}
+		if tail != nil {
+			return tail.Drain(ctx, true)
+		}
+		return nil
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -196,6 +243,13 @@ func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 			if err := p.finalFlush(ctx); err != nil {
 				logf("final flush: %v", err)
 			}
+			// Not final: closing digest windows early would count their remaining lines
+			// again after the restart re-reads them.
+			if tail != nil {
+				if err := tail.Drain(ctx, false); err != nil {
+					logf("final fsm log tail: %v", err)
+				}
+			}
 			return nil
 
 		case <-ticker.C:
@@ -204,14 +258,48 @@ func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 				// and the cursor has not advanced, so the next tick retries the same rows.
 				log.Printf("projector: tick failed (will retry): %v", err)
 			}
-			if retention > 0 && time.Since(lastPrune) > time.Hour {
-				if err := rep.Prune(ctx, time.Now().Add(-retention)); err != nil {
-					log.Printf("projector: prune failed: %v", err)
+			if tail != nil {
+				if err := tail.Drain(ctx, false); err != nil {
+					log.Printf("projector: fsm log tail failed (will retry): %v", err)
+				}
+			}
+			if time.Since(lastPrune) > time.Hour {
+				if retention > 0 {
+					if err := rep.Prune(ctx, time.Now().Add(-retention)); err != nil {
+						log.Printf("projector: prune failed: %v", err)
+					}
+				}
+				if tail != nil {
+					pruneFSMLogs(ctx, rep, o)
 				}
 				lastPrune = time.Now()
 			}
 		}
 	}
+}
+
+// pruneFSMLogs applies the fsm_logs retention: delivered and older than -fsm-log-retention, or
+// older than -fsm-log-max-age regardless. Only the omega named by -fsm-log-omega-state counts
+// as delivery; any other omega reading the replica is ignored.
+func pruneFSMLogs(ctx context.Context, rep *replicaWriter, o options) {
+	var delivered *deliveredCursor
+	if o.fsmLogOmegaState != "" {
+		c, ok, why, err := omegaDelivered(ctx, o.fsmLogOmegaState, fsmLogsTable)
+		switch {
+		case err != nil:
+			log.Printf("projector: fsm_logs delivery unknown, keeping rows under %s: %v", o.fsmLogMaxAge, err)
+		case !ok:
+			log.Printf("projector: fsm_logs delivery unconfirmed (%s), keeping rows under %s", why, o.fsmLogMaxAge)
+		default:
+			delivered = &c
+		}
+	}
+	n, err := rep.PruneFSMLogs(ctx, time.Now(), o.fsmLogRetention, o.fsmLogMaxAge, delivered)
+	if err != nil {
+		log.Printf("projector: fsm_logs prune failed: %v", err)
+		return
+	}
+	logf("pruned %d fsm_logs rows", n)
 }
 
 // projector wires the three pieces together.

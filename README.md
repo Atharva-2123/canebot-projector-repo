@@ -135,6 +135,35 @@ sha256sum /path/to/config.db          # unchanged before and after
 synthetic intervals covering idle, maintenance, manual and error time so the timeline is
 continuous and availability is computable. Full reference in [db-overview.md](db-overview.md).
 
+## Controller log (`fsm_logs`)
+
+With `-fsm-log` set, the projector also tails the controller's stdout log into `fsm_logs`, one
+row per line. Off by default, and the table is not created until it is on.
+
+```bash
+./projector ... \
+  -fsm-log /data/local/canebot/logs/fsm.log \
+  -fsm-log-omega-state /data/local/canebot-projector-repo/omega/state-rs-ilyama2.db \
+  -fsm-log-retention 48h -fsm-log-max-age 168h
+```
+
+- **Roll out omega first.** Add `fsm_logs` to `table_strategies` (see `omega/omega-config.yaml`)
+  in every omega reading the replica and restart them, then turn the flag on. An omega that
+  finds the table unlisted installs `rows` triggers on it.
+- **Time.** The controller logs whole seconds in UTC. `logged_at_ms` is that second; `event_ts`
+  adds the line's position within it (`.000001000`, `.000002000`, …) so rows sort in log order
+  on `event_ts` alone. Lines without a date take it from the line before (`ts_source`).
+- **Repeats.** A line repeating within `-fsm-log-digest` (1m) is written once, then summarised
+  by one `ts_source='digest'` row carrying `repeat_count` and `first/last_seen_at_ms`. Errors,
+  warnings and continuation lines are always written line by line. `SUM(repeat_count)` is the
+  number of lines logged. On the live idle loop, ~133k lines in 90 minutes became ~2k rows.
+- **Retention.** A row is deleted when it is older than `-fsm-log-retention` **and** the omega
+  at `-fsm-log-omega-state` has delivered it, or when it is older than `-fsm-log-max-age`
+  regardless. "Delivered" is the broker's PUBACK, not the platform storing it; while omega holds
+  batches in its buffer or the platform has paused the table, nothing counts as delivered.
+- **The log file is never written.** Rotate it however you like — copy-then-truncate keeps the
+  lines written just before the cut, because the tail reads the rest of `<log>.1` first.
+
 ## Notes
 
 - `projector_state.db` and `omega/state.db` are **separate on purpose**. Neither belongs in a

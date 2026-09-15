@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -844,22 +845,64 @@ func (w *replicaWriter) AttributeActuatorPulses(ctx context.Context) error {
 // — once the agent's cursor has passed a row it has been delivered, and the permanent copy
 // lives in the cloud. Without this the file grows forever, which is exactly the problem the
 // source database already has.
+//
+// Each table is pruned on its own, so one failure no longer leaves the rest unpruned.
 func (w *replicaWriter) Prune(ctx context.Context, olderThan time.Time) error {
 	cutoff := eventTS(olderThan.UnixMilli())
 	tables := []string{"sensor_toggles", "config_history", "state_durations",
 		"step_dwells", "fault_events", "actuator_intervals", "cip_runs",
 		"door_events", "rollups", "gaps"}
+	var errs []error
 	for _, t := range tables {
 		if _, err := w.db.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE event_ts < ?`, t), cutoff); err != nil {
-			return fmt.Errorf("prune %s: %w", t, err)
+			errs = append(errs, fmt.Errorf("prune %s: %w", t, err))
 		}
 	}
-	// cycles last: it is the FK parent, so its children must be gone first.
-	if _, err := w.db.ExecContext(ctx, `DELETE FROM cycles WHERE event_ts < ?`, cutoff); err != nil {
-		return fmt.Errorf("prune cycles: %w", err)
+
+	// cycles last, and only the ones with no children left. A child's event_ts can be hours
+	// past its parent's — an order_id flushed again after the 15-minute cap keeps the first
+	// flush's cycles.event_ts, and actuator pulses are stamped at their own end — so a cycle
+	// past the cutoff can still have children that are not. Deleting it anyway failed the
+	// whole statement on the foreign key, and not one cycle was pruned. It goes on a later
+	// prune, once its last child has aged out.
+	children, err := w.cycleChildren(ctx)
+	if err != nil {
+		return errors.Join(append(errs, err)...)
 	}
-	return nil
+	q := `DELETE FROM cycles WHERE event_ts < ?`
+	for _, c := range children {
+		q += fmt.Sprintf(` AND NOT EXISTS (SELECT 1 FROM %q x WHERE x.%q = cycles.%q)`,
+			c.table, c.from, c.to)
+	}
+	if _, err := w.db.ExecContext(ctx, q, cutoff); err != nil {
+		errs = append(errs, fmt.Errorf("prune cycles: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+type fkChild struct{ table, from, to string }
+
+// cycleChildren lists every foreign key onto cycles, read from the replica rather than
+// hard-coded, so a table an older build left behind still holds its parents.
+func (w *replicaWriter) cycleChildren(ctx context.Context) ([]fkChild, error) {
+	rows, err := w.db.QueryContext(ctx,
+		`SELECT m.name, f."from", f."to"
+		   FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+		  WHERE m.type = 'table' AND f."table" = 'cycles'`)
+	if err != nil {
+		return nil, fmt.Errorf("list cycles children: %w", err)
+	}
+	defer rows.Close()
+	var out []fkChild
+	for rows.Next() {
+		var c fkChild
+		if err := rows.Scan(&c.table, &c.from, &c.to); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func boolToInt(b bool) int64 {

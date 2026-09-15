@@ -163,6 +163,52 @@ func (s *stateStore) LastAlive() (int64, error) {
 	return ms, nil
 }
 
+// logCursor is where the fsm.log tailer resumes. See log_cursors in stateSchema.
+type logCursor struct {
+	fileGen      string
+	dev, inode   uint64
+	offset       int64
+	lineNo       int64
+	headLen      int64
+	headSHA      string
+	lastLoggedMS int64
+}
+
+// LogCursor returns the saved read position for a log file, or ok=false if it was never read.
+func (s *stateStore) LogCursor(path string) (c logCursor, ok bool, err error) {
+	var dev, inode int64
+	err = s.db.QueryRow(
+		`SELECT file_gen, dev, inode, byte_offset, line_no, head_len, head_sha256, last_logged_at_ms
+		   FROM log_cursors WHERE path = ?`, path,
+	).Scan(&c.fileGen, &dev, &inode, &c.offset, &c.lineNo, &c.headLen, &c.headSHA, &c.lastLoggedMS)
+	if err == sql.ErrNoRows {
+		return logCursor{}, false, nil
+	}
+	if err != nil {
+		return logCursor{}, false, fmt.Errorf("read log cursor %s: %w", path, err)
+	}
+	c.dev, c.inode = uint64(dev), uint64(inode)
+	return c, true, nil
+}
+
+func (s *stateStore) SetLogCursor(path string, c logCursor) error {
+	_, err := s.db.Exec(
+		`INSERT INTO log_cursors (path, file_gen, dev, inode, byte_offset, line_no,
+		                          head_len, head_sha256, last_logged_at_ms, updated_at_ms)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)
+		 ON CONFLICT(path) DO UPDATE SET
+		     file_gen = excluded.file_gen, dev = excluded.dev, inode = excluded.inode,
+		     byte_offset = excluded.byte_offset, line_no = excluded.line_no,
+		     head_len = excluded.head_len, head_sha256 = excluded.head_sha256,
+		     last_logged_at_ms = excluded.last_logged_at_ms, updated_at_ms = excluded.updated_at_ms`,
+		path, c.fileGen, int64(c.dev), int64(c.inode), c.offset, c.lineNo,
+		c.headLen, c.headSHA, c.lastLoggedMS, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("write log cursor %s: %w", path, err)
+	}
+	return nil
+}
+
 // MarkAlive is called on every tick, whether or not it found anything.
 func (s *stateStore) MarkAlive(ms int64) {
 	if _, err := s.db.Exec(

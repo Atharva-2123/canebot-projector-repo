@@ -56,6 +56,15 @@ sqlite-replication:
       strategy: telemetry
       ts_column: event_ts
       include_columns: [id, event_ts, started_at_ms, ended_at_ms, duration_ms, order_id, completed, fault_count, date_utc]
+    # The controller's stdout log. Must be listed BEFORE the projector runs with -fsm-log, in
+    # every omega reading this replica: an unlisted table defaults to `rows` and gets triggers
+    # that switching to telemetry later does not remove. event_ts is line order, not sub-second
+    # time — logged_at_ms is the second the line was written. file_gen and byte_offset are the
+    # tailer's own bookkeeping and stay on the device.
+    fsm_logs:
+      strategy: telemetry
+      ts_column: event_ts
+      include_columns: [id, event_ts, logged_at_ms, ts_source, line_no, logger, level, category, tag, tag2, message, fingerprint, repeat_count, first_seen_at_ms, last_seen_at_ms, is_continuation, truncated, bucket_1m_ms, date_utc]
     config_history:
       strategy: telemetry
       ts_column: event_ts

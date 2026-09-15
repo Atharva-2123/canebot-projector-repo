@@ -362,6 +362,51 @@ CREATE INDEX IF NOT EXISTS idx_config_history_order   ON config_history(order_id
 CREATE INDEX IF NOT EXISTS idx_rollups_lookup          ON rollups(grain, dim_kind, bucket_start_ms);
 `
 
+// fsmLogsSchema is the controller's stdout log (fsm.log), one row per line.
+//
+// Deliberately NOT part of replicaSchema. Every omega reading the replica must list fsm_logs
+// under table_strategies before the table exists: an unlisted table defaults to the `rows`
+// strategy, which installs triggers that a later switch to `telemetry` never removes. So the
+// table is only created once -fsm-log is set, which lets the omega configs roll out first.
+//
+// It is also created in the same transaction as its first row. A table the agent sees empty is
+// marked snapshot-done and its cursor fast-forwarded past whatever lands next — the bug that has
+// already cost the rollup tables once.
+//
+// event_ts carries a sequence, not sub-second time. The controller logs whole seconds and up to
+// ~50 lines share one, while the platform drops the agent's row id — so the n-th line of a
+// second is stamped .000n00000 to keep the order in the one column every query sorts on. The
+// real second is logged_at_ms.
+const fsmLogsSchema = `
+CREATE TABLE IF NOT EXISTS fsm_logs (
+    id               INTEGER PRIMARY KEY,
+    event_ts         TEXT    NOT NULL,
+    logged_at_ms     INTEGER NOT NULL,
+    ts_source        TEXT    NOT NULL,   -- line | clock | inherited | tailer | digest
+    file_gen         TEXT    NOT NULL,   -- one log file lifetime: dev:inode:first_seen_ms
+    byte_offset      INTEGER NOT NULL,   -- where the line starts; -1 for tailer rows
+    line_no          INTEGER NOT NULL,   -- within file_gen
+    logger           TEXT,               -- db_hook | step_run | actuator_run | sensor_toggle
+    level            TEXT    NOT NULL,   -- error | warn | info
+    category         TEXT    NOT NULL,   -- modbus | fsm_step | fsm_state | observability
+                                         -- | tailer | other
+    tag              TEXT,               -- first [TAG] of the message
+    tag2             TEXT,               -- second [TAG], e.g. [TILTER-HOLD-GUARD] [Homing]
+    message          TEXT    NOT NULL,   -- without the date or logger prefix
+    fingerprint      TEXT    NOT NULL,   -- the message with its numbers blanked
+    repeat_count     INTEGER NOT NULL DEFAULT 1,
+    first_seen_at_ms INTEGER,            -- digest rows: the repeats this row stands for
+    last_seen_at_ms  INTEGER,
+    is_continuation  INTEGER NOT NULL DEFAULT 0,
+    truncated        INTEGER NOT NULL DEFAULT 0,
+    bucket_1m_ms     INTEGER NOT NULL,
+    date_utc         TEXT    NOT NULL,
+    UNIQUE(file_gen, byte_offset)
+);
+CREATE INDEX IF NOT EXISTS idx_fsm_logs_ts    ON fsm_logs(event_ts);
+CREATE INDEX IF NOT EXISTS idx_fsm_logs_level ON fsm_logs(level, bucket_1m_ms);
+`
+
 // stateSchema is projector_state.db — the projector's own bookkeeping.
 //
 // Deliberately a SEPARATE FILE from the replica: the edge agent auto-enrols every
@@ -412,5 +457,21 @@ CREATE TABLE IF NOT EXISTS config_snapshot (
 CREATE TABLE IF NOT EXISTS projector_meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+
+-- Read position in a tailed log file. dev/inode catch a replaced file, and the hash of its
+-- first bytes catches one truncated and regrown past byte_offset between two reads — a size
+-- check alone would resume mid-line in unrelated content.
+CREATE TABLE IF NOT EXISTS log_cursors (
+    path              TEXT PRIMARY KEY,
+    file_gen          TEXT    NOT NULL,
+    dev               INTEGER NOT NULL,
+    inode             INTEGER NOT NULL,
+    byte_offset       INTEGER NOT NULL,
+    line_no           INTEGER NOT NULL,
+    head_len          INTEGER NOT NULL,
+    head_sha256       TEXT    NOT NULL,
+    last_logged_at_ms INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms     INTEGER NOT NULL
 );
 `
