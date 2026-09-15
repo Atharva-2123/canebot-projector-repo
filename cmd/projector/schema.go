@@ -473,6 +473,23 @@ CREATE TABLE IF NOT EXISTS log_cursors (
     head_len          INTEGER NOT NULL,
     head_sha256       TEXT    NOT NULL,
     last_logged_at_ms INTEGER NOT NULL DEFAULT 0,
-    updated_at_ms     INTEGER NOT NULL
+    updated_at_ms     INTEGER NOT NULL,
+    -- Bytes pruned off the file's start in this generation. byte_offset is in the file as it
+    -- is now; rows carry base_offset + byte_offset, so a line never reuses a pruned one's key.
+    base_offset       INTEGER NOT NULL DEFAULT 0,
+    -- A prune about to happen: its length, and the hash of the bytes the file will start with
+    -- once it has. A restart that finds these compares, and so knows whether the cut landed.
+    pending_prune_len INTEGER NOT NULL DEFAULT 0,
+    pending_head_len  INTEGER NOT NULL DEFAULT 0,
+    pending_head_sha  TEXT    NOT NULL DEFAULT ''
 );
 `
+
+// logCursorColumns are the log_cursors columns added after the table first shipped, so an
+// existing projector_state.db gains them on open. CREATE TABLE IF NOT EXISTS does not.
+var logCursorColumns = []struct{ name, ddl string }{
+	{"base_offset", `ALTER TABLE log_cursors ADD COLUMN base_offset INTEGER NOT NULL DEFAULT 0`},
+	{"pending_prune_len", `ALTER TABLE log_cursors ADD COLUMN pending_prune_len INTEGER NOT NULL DEFAULT 0`},
+	{"pending_head_len", `ALTER TABLE log_cursors ADD COLUMN pending_head_len INTEGER NOT NULL DEFAULT 0`},
+	{"pending_head_sha", `ALTER TABLE log_cursors ADD COLUMN pending_head_sha TEXT NOT NULL DEFAULT ''`},
+}

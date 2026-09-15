@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -720,5 +721,308 @@ func TestPruneKeepsCyclesThatStillHaveChildren(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "ORD-recent,ORD-stale-with-child" {
 		t.Errorf("cycles after prune = %v; want the childless stale cycle gone and the parent kept", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// fsm.log pruning
+// ---------------------------------------------------------------------------
+
+// emulateCollapse stands in for fallocate(COLLAPSE_RANGE), which only Linux has: the same
+// inode, its first n bytes gone and the rest moved down. Not safe against a concurrent writer —
+// TestFSMLogPruneRealCollapseWithConcurrentWriter covers that on the machine itself.
+func emulateCollapse(t *testing.T) {
+	t.Helper()
+	prev := collapseFileStart
+	collapseFileStart = emulatedCollapse
+	t.Cleanup(func() { collapseFileStart = prev })
+}
+
+func emulatedCollapse(path string, n int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	if n >= int64(len(data)) {
+		return fmt.Errorf("collapse of %d reaches the end of a %d byte file", n, len(data))
+	}
+	if _, err := f.WriteAt(data[n:], 0); err != nil {
+		return err
+	}
+	return f.Truncate(int64(len(data)) - n)
+}
+
+// pruningTailer is openTailer with pruning on against an omega state db, small enough limits
+// that a test-sized log gets cut, and no wait between checks.
+func (f *logFixture) pruningTailer(now time.Time, digest time.Duration, omegaState string) (*logTailer, func()) {
+	f.t.Helper()
+	lt, closeTailer := f.openTailer(now, digest)
+	lt.pruneOmegaState, lt.pruneKeep, lt.pruneStep, lt.pruneEvery = omegaState, 8192, 1<<30, 0
+	return lt, closeTailer
+}
+
+// deliverThrough moves the fake omega's delivered cursor to fsm_logs row id (0: the newest).
+func (f *logFixture) deliverThrough(omegaState string, id int64) {
+	f.t.Helper()
+	rep := openRO(f.t, f.replicaPath)
+	if id == 0 {
+		id = scalarInt(f.t, rep, `SELECT MAX(id) FROM fsm_logs`)
+	}
+	ts := scalarStr(f.t, rep, `SELECT event_ts FROM fsm_logs WHERE id = ?`, id)
+	db, err := sql.Open("sqlite", "file:"+omegaState)
+	if err != nil {
+		f.t.Fatalf("open omega state: %v", err)
+	}
+	defer db.Close()
+	mustExec(f.t, db, `INSERT OR REPLACE INTO meta VALUES ('telemetry_ts_raw:fsm_logs', ?)`, ts)
+	mustExec(f.t, db, `INSERT OR REPLACE INTO meta VALUES ('telemetry_src_rowid:fsm_logs', ?)`, fmt.Sprint(id))
+}
+
+// appendSeq writes lines "seq <from>".."seq <to-1>", one per second from base.
+func (f *logFixture) appendSeq(from, to int) {
+	f.t.Helper()
+	var lines []string
+	for i := from; i < to; i++ {
+		lines = append(lines, logAt(base.Add(time.Duration(i)*time.Second), fmt.Sprintf("seq %d", i)))
+	}
+	f.appendLines(lines...)
+}
+
+// assertEverySeqOnce: lines "seq 0".."seq n-1" are each in fsm_logs exactly once.
+func (f *logFixture) assertEverySeqOnce(n int) {
+	f.t.Helper()
+	rep := openRO(f.t, f.replicaPath)
+	rows := scalarInt(f.t, rep, `SELECT COUNT(*) FROM fsm_logs WHERE message LIKE 'seq %'`)
+	distinct := scalarInt(f.t, rep, `SELECT COUNT(DISTINCT message) FROM fsm_logs WHERE message LIKE 'seq %'`)
+	if rows != int64(n) || distinct != int64(n) {
+		f.t.Fatalf("seq rows = %d (%d distinct), want each of %d lines exactly once", rows, distinct, n)
+	}
+	if g := scalarInt(f.t, rep, `SELECT COUNT(DISTINCT file_gen) FROM fsm_logs`); g != 1 {
+		f.t.Errorf("generations = %d, want 1 — a prune was mistaken for a truncation", g)
+	}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fi.Size()
+}
+
+// TestFSMLogFileIsPrunedOnlyAfterDelivery is the rule: bytes leave fsm.log once, and only once,
+// ilyama2 has the rows that carry them — and lines written after a prune still land, each once.
+// Rows are keyed on offset, so a prune that let a new line reuse a pruned offset would drop it
+// as a duplicate without a word.
+func TestFSMLogFileIsPrunedOnlyAfterDelivery(t *testing.T) {
+	emulateCollapse(t)
+	f := newLogFixture(t)
+	omega := newOmegaState(t, "", 0, false, false)
+	f.appendSeq(0, 2000)
+	lt, closeTailer := f.pruningTailer(base.Add(time.Hour), 0, omega)
+	defer closeTailer()
+	ctx := context.Background()
+
+	full := fileSize(t, f.log)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got != full {
+		t.Fatalf("fsm.log went from %d to %d bytes before omega delivered anything", full, got)
+	}
+
+	f.deliverThrough(omega, 0)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got >= full || got < lt.pruneKeep {
+		t.Fatalf("fsm.log is %d bytes after delivery (was %d); want it cut down to about %d", got, full, lt.pruneKeep)
+	}
+
+	f.appendSeq(2000, 4000)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.appendSeq(4000, 4010)
+	if err := lt.Drain(ctx, true); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.assertEverySeqOnce(4010)
+}
+
+// TestFSMLogPruneNeverCutsUndeliveredLines: delivered only part way, the file must still hold
+// every line after that point.
+func TestFSMLogPruneNeverCutsUndeliveredLines(t *testing.T) {
+	emulateCollapse(t)
+	f := newLogFixture(t)
+	omega := newOmegaState(t, "", 0, false, false)
+	f.appendSeq(0, 3000)
+	lt, closeTailer := f.pruningTailer(base.Add(time.Hour), 0, omega)
+	defer closeTailer()
+	if err := lt.Drain(context.Background(), false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	f.deliverThrough(omega, scalarInt(t, openRO(t, f.replicaPath), `SELECT id FROM fsm_logs WHERE message = 'seq 1000'`))
+	// A later checkpoint that is not delivered yet must not be what the cut uses.
+	f.appendSeq(3000, 3100)
+	for i := 0; i < 2; i++ {
+		if err := lt.Drain(context.Background(), false); err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+	}
+
+	data, err := os.ReadFile(f.log)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	for i := 1001; i < 3100; i++ {
+		if !strings.Contains(string(data), fmt.Sprintf(" seq %d\n", i)) {
+			t.Fatalf("seq %d is gone from fsm.log, but omega had only delivered through seq 1000", i)
+		}
+	}
+}
+
+// TestFSMLogPruneKeepsRecentHistory: whatever has been delivered, the last pruneKeep bytes stay
+// so the file is still worth reading on the machine.
+func TestFSMLogPruneKeepsRecentHistory(t *testing.T) {
+	emulateCollapse(t)
+	f := newLogFixture(t)
+	omega := newOmegaState(t, "", 0, false, false)
+	f.appendSeq(0, 500)
+	lt, closeTailer := f.pruningTailer(base.Add(time.Hour), 0, omega)
+	defer closeTailer()
+	lt.pruneKeep = 1 << 20
+	if err := lt.Drain(context.Background(), false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	before := fileSize(t, f.log)
+	if err := lt.Drain(context.Background(), false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got != before {
+		t.Errorf("a %d byte log was cut to %d with 1MB to keep", before, got)
+	}
+}
+
+// TestFSMLogPruneWaitsForOpenDigestWindows: a line inside a window still open has no row yet
+// beyond its window's first — the digest carrying the rest is written when the window closes.
+// Cutting it on the strength of the first row alone would lose the count.
+func TestFSMLogPruneWaitsForOpenDigestWindows(t *testing.T) {
+	emulateCollapse(t)
+	f := newLogFixture(t)
+	omega := newOmegaState(t, "", 0, false, false)
+	var lines []string
+	for s := 0; s < 50; s++ {
+		for i := 0; i < 20; i++ {
+			lines = append(lines, logAt(base.Add(time.Duration(s)*time.Second), fmt.Sprintf("Singling blocked %d", i)))
+		}
+	}
+	f.appendLines(lines...)
+	lt, closeTailer := f.pruningTailer(base.Add(20*time.Second), time.Minute, omega)
+	defer closeTailer()
+	ctx := context.Background()
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	before := fileSize(t, f.log)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got != before {
+		t.Fatalf("fsm.log cut from %d to %d while its only window was open", before, got)
+	}
+
+	lt.now = func() time.Time { return base.Add(2 * time.Minute) }
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got >= before {
+		t.Errorf("fsm.log not cut once the window closed and its digest was delivered")
+	}
+	if n := scalarInt(t, openRO(t, f.replicaPath),
+		`SELECT SUM(repeat_count) FROM fsm_logs WHERE category <> 'tailer'`); n != int64(len(lines)) {
+		t.Errorf("lines accounted for = %d, want %d", n, len(lines))
+	}
+}
+
+// TestFSMLogPruneInterruptedAroundTheCut kills the projector at the two moments a prune can be
+// caught half done — cut recorded but not made, and cut made but position not yet moved. The
+// restart must resume exactly: no line re-read into a duplicate, none skipped, no new generation.
+func TestFSMLogPruneInterruptedAroundTheCut(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		collide func(path string, n int64) error
+	}{
+		{"before the cut", func(string, int64) error { panic("killed before the cut") }},
+		{"after the cut", func(path string, n int64) error {
+			if err := emulatedCollapse(path, n); err != nil {
+				return err
+			}
+			panic("killed after the cut")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			emulateCollapse(t)
+			f := newLogFixture(t)
+			omega := newOmegaState(t, "", 0, false, false)
+			f.appendSeq(0, 2000)
+			lt, closeTailer := f.pruningTailer(base.Add(time.Hour), 0, omega)
+			if err := lt.Drain(context.Background(), false); err != nil {
+				t.Fatalf("drain: %v", err)
+			}
+			f.deliverThrough(omega, 0)
+
+			collapseFileStart = tc.collide
+			func() {
+				defer func() { _ = recover() }()
+				_ = lt.Drain(context.Background(), false)
+			}()
+			closeTailer()
+			collapseFileStart = emulatedCollapse
+
+			f.appendSeq(2000, 2500)
+			lt, closeTailer = f.pruningTailer(base.Add(time.Hour), 0, omega)
+			defer closeTailer()
+			if err := lt.Drain(context.Background(), true); err != nil {
+				t.Fatalf("drain after restart: %v", err)
+			}
+			f.deliverThrough(omega, 0)
+			f.appendSeq(2500, 2600)
+			if err := lt.Drain(context.Background(), true); err != nil {
+				t.Fatalf("drain: %v", err)
+			}
+			f.assertEverySeqOnce(2600)
+		})
+	}
+}
+
+// TestFSMLogPruneNeedsDeliveryConfigured: pruning with nothing to confirm delivery would cut
+// lines nobody shipped, so the projector refuses to start that way.
+func TestFSMLogPruneNeedsDeliveryConfigured(t *testing.T) {
+	f := newLogFixture(t)
+	err := runWith(options{
+		sourcePath: f.source, replicaPath: f.replicaPath, statePath: f.statePath,
+		interval: time.Second, batchSize: 500, once: true,
+		fsmLogPath: f.log, fsmLogPruneFile: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "-fsm-log-omega-state") {
+		t.Fatalf("runWith = %v, want a refusal naming -fsm-log-omega-state", err)
 	}
 }

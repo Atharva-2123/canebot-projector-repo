@@ -31,6 +31,16 @@ func openState(path string) (*stateStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("init state schema: %w", err)
 	}
+	for _, c := range logCursorColumns {
+		has, err := replicaHasColumn(db, "log_cursors", c.name)
+		if err == nil && !has {
+			_, err = db.Exec(c.ddl)
+		}
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate state log_cursors.%s: %w", c.name, err)
+		}
+	}
 
 	s := &stateStore{db: db, marks: map[string]string{}}
 	if err := s.loadWatermarks(); err != nil {
@@ -167,20 +177,28 @@ func (s *stateStore) LastAlive() (int64, error) {
 type logCursor struct {
 	fileGen      string
 	dev, inode   uint64
-	offset       int64
+	offset       int64 // in the file as it is now
 	lineNo       int64
 	headLen      int64
 	headSHA      string
 	lastLoggedMS int64
+	base         int64 // bytes pruned off this generation's start; row keys are base+offset
+
+	// A prune in flight — see pending_* in log_cursors.
+	pendingLen     int64
+	pendingHeadLen int64
+	pendingHeadSHA string
 }
 
 // LogCursor returns the saved read position for a log file, or ok=false if it was never read.
 func (s *stateStore) LogCursor(path string) (c logCursor, ok bool, err error) {
 	var dev, inode int64
 	err = s.db.QueryRow(
-		`SELECT file_gen, dev, inode, byte_offset, line_no, head_len, head_sha256, last_logged_at_ms
+		`SELECT file_gen, dev, inode, byte_offset, line_no, head_len, head_sha256, last_logged_at_ms,
+		        base_offset, pending_prune_len, pending_head_len, pending_head_sha
 		   FROM log_cursors WHERE path = ?`, path,
-	).Scan(&c.fileGen, &dev, &inode, &c.offset, &c.lineNo, &c.headLen, &c.headSHA, &c.lastLoggedMS)
+	).Scan(&c.fileGen, &dev, &inode, &c.offset, &c.lineNo, &c.headLen, &c.headSHA, &c.lastLoggedMS,
+		&c.base, &c.pendingLen, &c.pendingHeadLen, &c.pendingHeadSHA)
 	if err == sql.ErrNoRows {
 		return logCursor{}, false, nil
 	}
@@ -194,15 +212,19 @@ func (s *stateStore) LogCursor(path string) (c logCursor, ok bool, err error) {
 func (s *stateStore) SetLogCursor(path string, c logCursor) error {
 	_, err := s.db.Exec(
 		`INSERT INTO log_cursors (path, file_gen, dev, inode, byte_offset, line_no,
-		                          head_len, head_sha256, last_logged_at_ms, updated_at_ms)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)
+		                          head_len, head_sha256, last_logged_at_ms, updated_at_ms,
+		                          base_offset, pending_prune_len, pending_head_len, pending_head_sha)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(path) DO UPDATE SET
 		     file_gen = excluded.file_gen, dev = excluded.dev, inode = excluded.inode,
 		     byte_offset = excluded.byte_offset, line_no = excluded.line_no,
 		     head_len = excluded.head_len, head_sha256 = excluded.head_sha256,
-		     last_logged_at_ms = excluded.last_logged_at_ms, updated_at_ms = excluded.updated_at_ms`,
+		     last_logged_at_ms = excluded.last_logged_at_ms, updated_at_ms = excluded.updated_at_ms,
+		     base_offset = excluded.base_offset, pending_prune_len = excluded.pending_prune_len,
+		     pending_head_len = excluded.pending_head_len, pending_head_sha = excluded.pending_head_sha`,
 		path, c.fileGen, int64(c.dev), int64(c.inode), c.offset, c.lineNo,
-		c.headLen, c.headSHA, c.lastLoggedMS, time.Now().UnixMilli())
+		c.headLen, c.headSHA, c.lastLoggedMS, time.Now().UnixMilli(),
+		c.base, c.pendingLen, c.pendingHeadLen, c.pendingHeadSHA)
 	if err != nil {
 		return fmt.Errorf("write log cursor %s: %w", path, err)
 	}

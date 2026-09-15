@@ -162,8 +162,16 @@ row per line. Off by default, and the table is not created until it is on.
   at `-fsm-log-omega-state` has delivered it, or when it is older than `-fsm-log-max-age`
   regardless. "Delivered" is the broker's PUBACK, not the platform storing it; while omega holds
   batches in its buffer or the platform has paused the table, nothing counts as delivered.
-- **The log file is never written.** Rotate it however you like — copy-then-truncate keeps the
-  lines written just before the cut, because the tail reads the rest of `<log>.1` first.
+- **Pruning the log file** (`-fsm-log-prune-file`, needs `-fsm-log-omega-state`). Bytes are cut
+  off the start of `fsm.log` once the omega at `-fsm-log-omega-state` has delivered every row that
+  carries them; the last `-fsm-log-keep-mb` (8) always stay so the file still shows recent history.
+  The cut is `fallocate(COLLAPSE_RANGE)`: same inode, whole filesystem blocks, at most 8MB at a
+  time. It cannot race the controller, whose descriptor is `O_APPEND` — every write lands at the
+  end as the file then is — so unlike truncating it never loses a line written mid-prune. Each
+  cut briefly holds the file's lock, and the controller's log writes wait for it (~5–8ms per 16MB,
+  measured on the machine). The file may start partway into a line that was already delivered.
+- **Without pruning the log file is never written.** Rotate it however you like — copy-then-
+  truncate keeps the lines written just before the cut, because the tail reads `<log>.1` first.
 
 ## Notes
 

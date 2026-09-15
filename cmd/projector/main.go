@@ -89,6 +89,8 @@ func main() {
 		fsmLogMaxAge    = flag.Duration("fsm-log-max-age", 7*24*time.Hour, "delete fsm_logs rows older than this whether delivered or not")
 		fsmLogOmega     = flag.String("fsm-log-omega-state", "", "state db of the omega whose delivery allows -fsm-log-retention (empty: only -fsm-log-max-age applies)")
 		fsmLogDigest    = flag.Duration("fsm-log-digest", time.Minute, "collapse a line repeating within this window into one row (0: keep every line)")
+		fsmLogPrune     = flag.Bool("fsm-log-prune-file", false, "cut lines off the start of -fsm-log once omega at -fsm-log-omega-state has delivered them")
+		fsmLogKeepMB    = flag.Int("fsm-log-keep-mb", 8, "with -fsm-log-prune-file, always leave at least this much of the log in the file")
 	)
 	flag.Parse()
 	verbose = *verboseFlag
@@ -98,6 +100,7 @@ func main() {
 		interval: *interval, batchSize: *batchSize, retention: *retention, once: *once,
 		fsmLogPath: *fsmLog, fsmLogRetention: *fsmLogRetention, fsmLogMaxAge: *fsmLogMaxAge,
 		fsmLogOmegaState: *fsmLogOmega, fsmLogDigest: *fsmLogDigest,
+		fsmLogPruneFile: *fsmLogPrune, fsmLogKeepBytes: int64(*fsmLogKeepMB) << 20,
 	}); err != nil {
 		log.Fatalf("projector: %v", err)
 	}
@@ -115,6 +118,8 @@ type options struct {
 	fsmLogMaxAge     time.Duration
 	fsmLogOmegaState string
 	fsmLogDigest     time.Duration
+	fsmLogPruneFile  bool
+	fsmLogKeepBytes  int64
 }
 
 func run(sourcePath, replicaPath, statePath string, interval time.Duration,
@@ -129,6 +134,10 @@ func runWith(o options) error {
 	sourcePath, replicaPath, statePath := o.sourcePath, o.replicaPath, o.statePath
 	interval, batchSize, retention, once := o.interval, o.batchSize, o.retention, o.once
 
+	if o.fsmLogPruneFile && (o.fsmLogPath == "" || o.fsmLogOmegaState == "") {
+		// Pruning without a delivery source would have to cut lines nobody confirmed shipped.
+		return fmt.Errorf("-fsm-log-prune-file needs -fsm-log and -fsm-log-omega-state")
+	}
 	if _, err := os.Stat(sourcePath); err != nil {
 		return fmt.Errorf("source database %s: %w", sourcePath, err)
 	}
@@ -206,6 +215,9 @@ func runWith(o options) error {
 	var tail *logTailer
 	if o.fsmLogPath != "" {
 		tail = newLogTailer(o.fsmLogPath, rep, st, o.fsmLogDigest)
+		if o.fsmLogPruneFile {
+			tail.pruneOmegaState, tail.pruneKeep = o.fsmLogOmegaState, o.fsmLogKeepBytes
+		}
 	}
 
 	if once {
