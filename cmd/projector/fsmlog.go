@@ -538,24 +538,34 @@ func (lt *logTailer) closeDigests(beforeMS int64) []logLine {
 		}
 		return closing[i].resume.offset < closing[j].resume.offset
 	})
+	winMS := lt.window.Milliseconds()
+	perWindow := map[int64]int64{}
+	for _, d := range closing {
+		if d.repeats > 0 {
+			perWindow[d.bucketStartMS]++
+		}
+	}
 	var out []logLine
-	seq := map[int64]int64{}
+	placed := map[int64]int64{}
 	for _, d := range closing {
 		if d.repeats == 0 {
 			continue
 		}
 		// The digest takes the last repeat's position, which no other row holds, so it is
-		// unique and a replay regenerates it identically. Its event_ts is the window's last
-		// millisecond — after every line written inside the window, before any line of the
-		// next — plus a sequence, so the window's digests do not all share one timestamp.
+		// unique and a replay regenerates it identically.
+		//
+		// Its event_ts is in the window's last milliseconds, one each, ending on the last:
+		// after the lines written inside the window — which sit a few ms past their second —
+		// and before any line of the next, without two digests sharing a millisecond.
 		r := d.last
 		first, last := d.firstSeenMS, d.last.loggedAtMS
 		r.tsSource = "digest"
 		r.repeatCount = d.repeats
 		r.firstSeenMS, r.lastSeenMS = &first, &last
-		endMS := d.bucketStartMS + lt.window.Milliseconds() - 1
-		seq[endMS]++
-		r.eventTS = sequenceTS(endMS, min(seq[endMS], 999))
+		endMS := d.bucketStartMS + winMS - 1
+		slot := endMS - (perWindow[d.bucketStartMS] - 1 - placed[d.bucketStartMS])
+		placed[d.bucketStartMS]++
+		r.eventTS = eventTS(max(slot, d.bucketStartMS))
 		out = append(out, r)
 	}
 	return out
@@ -663,22 +673,22 @@ func (lt *logTailer) write(ctx context.Context, rows []logLine) error {
 	return nil
 }
 
-// sequencedTS stamps the n-th row logged in the same millisecond n microseconds after it.
+// sequencedTS stamps the n-th row logged at the same instant n milliseconds after it.
+//
+// Milliseconds, not anything finer: the platform stores event_ts as DateTime64(3), so a finer
+// step is truncated away there and every line of a busy second comes back tied. The cost is
+// that a line's event_ts can sit up to ~50ms (the idle loop's rate) past the second it was
+// logged in — logged_at_ms keeps the real one. Capped below the next second, so a second with
+// more lines than that ties at its end rather than overtaking the next second's lines.
 func (lt *logTailer) sequencedTS(ms int64) string {
 	if ms == lt.seqMS {
-		if lt.seq < 999 {
+		if lt.seq < 999-ms%1000 {
 			lt.seq++
 		}
 	} else {
-		lt.seqMS, lt.seq = ms, 1
+		lt.seqMS, lt.seq = ms, 0
 	}
-	return sequenceTS(ms, lt.seq)
-}
-
-// sequenceTS renders ms plus seq microseconds in eventTS's fixed-width form.
-func sequenceTS(ms, seq int64) string {
-	ns := ms*int64(time.Millisecond) + seq*int64(time.Microsecond)
-	return time.Unix(0, ns).UTC().Format("2006-01-02T15:04:05.000000000") + "Z"
+	return eventTS(ms + lt.seq)
 }
 
 func fileIdentity(fi os.FileInfo) (dev, inode uint64) {

@@ -176,9 +176,13 @@ func TestFSMLogIdleLoopLinesAreNotErrors(t *testing.T) {
 	}
 }
 
+// platformTS is event_ts as the platform keeps it: DateTime64(3), so to the millisecond.
+func platformTS(ts string) string { return ts[:len("2026-08-11T10:00:00.000")] }
+
 // TestFSMLogEventTSKeepsLineOrderWithinASecond: the controller logs whole seconds, and the
 // platform drops the agent's row id, so without the sequence every line of a busy second would
-// share one timestamp and come back in any order.
+// share one timestamp and come back in any order. The order has to survive the platform's
+// millisecond precision, not just the replica's nine digits.
 func TestFSMLogEventTSKeepsLineOrderWithinASecond(t *testing.T) {
 	f := newLogFixture(t)
 	for i := 0; i < 5; i++ {
@@ -204,8 +208,9 @@ func TestFSMLogEventTSKeepsLineOrderWithinASecond(t *testing.T) {
 		if len(ts) != wantWidth {
 			t.Fatalf("event_ts %q is not fixed width", ts)
 		}
-		if ts <= prev {
-			t.Fatalf("event_ts %s does not sort after %s; same-second lines lose their order", ts, prev)
+		if prev != "" && platformTS(ts) <= platformTS(prev) {
+			t.Fatalf("event_ts %s does not sort after %s at millisecond precision; "+
+				"same-second lines lose their order on the platform", ts, prev)
 		}
 		if at != base.UnixMilli() {
 			t.Errorf("logged_at_ms = %d, want the real second %d", at, base.UnixMilli())
@@ -216,10 +221,53 @@ func TestFSMLogEventTSKeepsLineOrderWithinASecond(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("rows = %d, want 5", n)
 	}
-	// The "started" marker takes the first step of that second; the first line follows it.
+	// The "started" marker takes the second's first millisecond; the first line follows it.
 	if first := scalarStr(t, rep,
-		`SELECT event_ts FROM fsm_logs WHERE line_no = 1`); first != "2026-08-11T10:00:00.000002000Z" {
-		t.Errorf("first line event_ts = %s, want its logged second plus a sequence step", first)
+		`SELECT event_ts FROM fsm_logs WHERE line_no = 1`); first != "2026-08-11T10:00:00.001000000Z" {
+		t.Errorf("first line event_ts = %s, want its logged second plus one millisecond step", first)
+	}
+}
+
+// TestFSMLogDigestsKeepTheirOwnMilliseconds: a window closes with one digest per repeating line,
+// all at its end. Sharing one millisecond, they tie on the platform; they must also land after
+// every line of their window and before the next window's.
+func TestFSMLogDigestsKeepTheirOwnMilliseconds(t *testing.T) {
+	f := newLogFixture(t)
+	var lines []string
+	for s := 0; s < 60; s++ {
+		for _, msg := range []string{"Singling blocked %d", "Cup transfer already at dispense %d", "heartbeat %d"} {
+			lines = append(lines, logAt(base.Add(time.Duration(s)*time.Second), fmt.Sprintf(msg, s)))
+		}
+	}
+	lines = append(lines, logAt(base.Add(time.Minute), "next window"))
+	f.appendLines(lines...)
+	rep := f.runOnce(time.Minute)
+
+	rows, err := rep.Query(`SELECT event_ts, ts_source FROM fsm_logs ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var prev string
+	digests := 0
+	for rows.Next() {
+		var ts, src string
+		if err := rows.Scan(&ts, &src); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if prev != "" && platformTS(ts) <= platformTS(prev) {
+			t.Fatalf("%s row at %s does not sort after %s at millisecond precision", src, ts, prev)
+		}
+		if src == "digest" {
+			digests++
+			if !strings.HasPrefix(ts, "2026-08-11T10:00:59.99") {
+				t.Errorf("digest event_ts %s is not at the end of its window", ts)
+			}
+		}
+		prev = ts
+	}
+	if digests != 3 {
+		t.Errorf("digest rows = %d, want 3", digests)
 	}
 }
 

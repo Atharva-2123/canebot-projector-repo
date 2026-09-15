@@ -151,8 +151,9 @@ row per line. Off by default, and the table is not created until it is on.
   in every omega reading the replica and restart them, then turn the flag on. An omega that
   finds the table unlisted installs `rows` triggers on it.
 - **Time.** The controller logs whole seconds in UTC. `logged_at_ms` is that second; `event_ts`
-  adds the line's position within it (`.000001000`, `.000002000`, …) so rows sort in log order
-  on `event_ts` alone. Lines without a date take it from the line before (`ts_source`).
+  adds the line's position within it in milliseconds (`.000`, `.001`, `.002`, …) so rows sort in
+  log order on `event_ts` alone — including on the platform, which stores it as DateTime64(3).
+  Lines without a date take it from the line before (`ts_source`).
 - **Repeats.** A line repeating within `-fsm-log-digest` (1m) is written once, then summarised
   by one `ts_source='digest'` row carrying `repeat_count` and `first/last_seen_at_ms`. Errors,
   warnings and continuation lines are always written line by line. `SUM(repeat_count)` is the

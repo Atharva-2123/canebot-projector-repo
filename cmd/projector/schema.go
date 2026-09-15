@@ -375,8 +375,9 @@ CREATE INDEX IF NOT EXISTS idx_rollups_lookup          ON rollups(grain, dim_kin
 //
 // event_ts carries a sequence, not sub-second time. The controller logs whole seconds and up to
 // ~50 lines share one, while the platform drops the agent's row id — so the n-th line of a
-// second is stamped .000n00000 to keep the order in the one column every query sorts on. The
-// real second is logged_at_ms.
+// second is stamped n milliseconds into it, to keep the order in the one column every query
+// sorts on. Milliseconds because the platform stores DateTime64(3). The real second is
+// logged_at_ms.
 const fsmLogsSchema = `
 CREATE TABLE IF NOT EXISTS fsm_logs (
     id               INTEGER PRIMARY KEY,
