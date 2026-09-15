@@ -56,6 +56,9 @@ const (
 	// so the controller's log writes wait for it: measured on the machine's ext4 at ~5–8ms for
 	// 16MB and ~65ms for 256MB. Stay small; the log grows ~12MB an hour.
 	logPruneStep = 8 << 20
+	// logPruneMin is the least worth cutting. Without it a caught-up tail trims a few tens of KB
+	// every check, taking the file's lock twice a minute to reclaim almost nothing.
+	logPruneMin = 1 << 20
 	// logPruneEvery spaces out delivery checks, each of which opens omega's state db.
 	logPruneEvery = 30 * time.Second
 	// logSnapshotsMax bounds the checkpoints kept while omega is not delivering.
@@ -291,6 +294,7 @@ type logTailer struct {
 	pruneOmegaState string        // the omega whose delivery allows a cut
 	pruneKeep       int64         // bytes always left in the file, delivered or not
 	pruneStep       int64         // most bytes cut at once; the controller's writes wait on it
+	pruneMin        int64         // least bytes worth a cut
 	pruneEvery      time.Duration // least time between delivery checks
 
 	loaded     bool
@@ -328,7 +332,7 @@ type logDigest struct {
 func newLogTailer(path string, rep *replicaWriter, st *stateStore, window time.Duration) *logTailer {
 	return &logTailer{
 		path: path, rep: rep, st: st, window: window, now: time.Now,
-		pruneStep: logPruneStep, pruneEvery: logPruneEvery,
+		pruneStep: logPruneStep, pruneMin: logPruneMin, pruneEvery: logPruneEvery,
 	}
 }
 
@@ -833,7 +837,7 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	block := fileBlockSize(fi)
 	cut := min(upTo-lt.cur.base, size-lt.pruneKeep, lt.pruneStep)
 	cut -= cut % block
-	if cut <= 0 || cut >= size {
+	if cut <= 0 || cut < lt.pruneMin || cut >= size {
 		return nil
 	}
 

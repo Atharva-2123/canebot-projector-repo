@@ -762,7 +762,7 @@ func emulatedCollapse(path string, n int64) error {
 func (f *logFixture) pruningTailer(now time.Time, digest time.Duration, omegaState string) (*logTailer, func()) {
 	f.t.Helper()
 	lt, closeTailer := f.openTailer(now, digest)
-	lt.pruneOmegaState, lt.pruneKeep, lt.pruneStep, lt.pruneEvery = omegaState, 8192, 1<<30, 0
+	lt.pruneOmegaState, lt.pruneKeep, lt.pruneStep, lt.pruneMin, lt.pruneEvery = omegaState, 8192, 1<<30, 0, 0
 	return lt, closeTailer
 }
 
@@ -1025,4 +1025,43 @@ func TestFSMLogPruneNeedsDeliveryConfigured(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "-fsm-log-omega-state") {
 		t.Fatalf("runWith = %v, want a refusal naming -fsm-log-omega-state", err)
 	}
+}
+
+// TestFSMLogPruneWaitsForAWorthwhileCut: a caught-up tail has only a few KB of newly delivered
+// log at each check. Cutting that every time takes the controller's file lock over and over to
+// reclaim nothing, so a cut waits until at least pruneMin is due.
+func TestFSMLogPruneWaitsForAWorthwhileCut(t *testing.T) {
+	emulateCollapse(t)
+	f := newLogFixture(t)
+	omega := newOmegaState(t, "", 0, false, false)
+	f.appendSeq(0, 700) // ~20KB: whole blocks past the keep, but under the minimum
+	lt, closeTailer := f.pruningTailer(base.Add(time.Hour), 0, omega)
+	defer closeTailer()
+	lt.pruneMin = 64 << 10
+	ctx := context.Background()
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	before := fileSize(t, f.log)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got != before {
+		t.Fatalf("cut %d bytes, under the %d minimum", before-got, lt.pruneMin)
+	}
+
+	f.appendSeq(700, 6000) // ~160KB: well past keep + minimum
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	f.deliverThrough(omega, 0)
+	grown := fileSize(t, f.log)
+	if err := lt.Drain(ctx, false); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := fileSize(t, f.log); got >= grown || got > lt.pruneKeep+8192 {
+		t.Errorf("fsm.log %d bytes after a check with %d due; want it cut down to the keep", got, grown-lt.pruneKeep)
+	}
+	f.assertEverySeqOnce(6000)
 }

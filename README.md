@@ -164,7 +164,8 @@ row per line. Off by default, and the table is not created until it is on.
   batches in its buffer or the platform has paused the table, nothing counts as delivered.
 - **Pruning the log file** (`-fsm-log-prune-file`, needs `-fsm-log-omega-state`). Bytes are cut
   off the start of `fsm.log` once the omega at `-fsm-log-omega-state` has delivered every row that
-  carries them; the last `-fsm-log-keep-mb` (8) always stay so the file still shows recent history.
+  carries them; the last `-fsm-log-keep-mb` (8) always stay so the file still shows recent history,
+  and a cut waits until at least 1MB is due, so the file sits between 8 and 9MB.
   The cut is `fallocate(COLLAPSE_RANGE)`: same inode, whole filesystem blocks, at most 8MB at a
   time. It cannot race the controller, whose descriptor is `O_APPEND` — every write lands at the
   end as the file then is — so unlike truncating it never loses a line written mid-prune. Each
