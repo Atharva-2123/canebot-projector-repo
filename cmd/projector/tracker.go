@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"canebot-fsm/io"
@@ -68,11 +69,31 @@ const (
 	resultError                 = "error"
 )
 
+// isMaintenanceState reports whether a firmware state name is a Maintenance (CIP) state.
+//
+// The firmware does NOT write a bare "Maintenance". It writes the variant that started the
+// clean, and the suffix is the trigger: observed on the machine as "Maintenance_regular" and
+// "Maintenance_auto_cip_cmd3". Every bare-literal comparison therefore never fired, and the
+// failures were silent rather than loud:
+//
+//	cip_runs        stayed empty forever — emitCIPRuns selects Maintenance spans
+//	maintenance_ms  billed to idle — the occupancy switch fell through to default
+//	is_downtime     0 through every clean, inflating availability
+//	cycles.result   never held "maintenance", which broke the CIP completion probe
+//
+// Match on the prefix so a variant the firmware adds later is picked up rather than silently
+// dropped into idle. The suffix itself is the distinction the cip_runs comment calls missing:
+// "_regular" is operator/counter-triggered, "_auto_cip_cmd3" is the auto CIP command.
+func isMaintenanceState(state string) bool {
+	return strings.HasPrefix(state, "Maintenance")
+}
+
 // resultForState maps a non-production stretch to its interval kind.
 func resultForState(state string) string {
-	switch state {
-	case "Maintenance":
+	if isMaintenanceState(state) {
 		return resultMaintenance
+	}
+	switch state {
 	case "Manual":
 		return resultManual
 	case "Error":
@@ -267,9 +288,24 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 		if t.current != nil && t.current.orderKey == orderKey {
 			return
 		}
+		// AutoCycle often starts a few milliseconds before the orders row is applied, so
+		// the first events land on a synthetic IDLE interval. Promote that interval to
+		// the production key instead of closing it — closing would reset dwellSeq and
+		// leave the early AutoCycle steps on a different cycle (or drop them).
+		if t.current != nil && !t.current.isProduction && t.current.isAutoCyclePrelude() {
+			t.current.adoptProduction(orderKey)
+			return
+		}
 		t.closeInterval(atMS, "")
 		t.current = newInterval(orderKey, true, atMS, resultAborted)
 		t.resetPerInterval()
+		return
+	}
+
+	// Events with a blank order_key still belong to the drink if one is open. Stealing
+	// the interval here was splitting ORD-* into an IDLE fragment plus a later production
+	// fragment, and UNIQUE(order_id) then kept only the later fragment's steps.
+	if t.current != nil && t.current.isProduction {
 		return
 	}
 
@@ -282,13 +318,61 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 	t.resetPerInterval()
 }
 
+// isAutoCyclePrelude reports whether this synthetic interval is the few milliseconds of
+// AutoCycle that happen before the orders row is visible. HomeIdle / Manual / Error
+// synthetics must not be adopted — those are a different stretch of machine time.
+func (iv *interval) isAutoCyclePrelude() bool {
+	if iv == nil || iv.isProduction || iv.result != resultIdle {
+		return false
+	}
+	if _, ok := iv.uniqueStates["AutoCycle"]; ok {
+		return true
+	}
+	for _, d := range iv.stepDwells {
+		if d.state == "AutoCycle" {
+			return true
+		}
+	}
+	return false
+}
+
+func (iv *interval) adoptProduction(orderKey string) {
+	iv.orderKey = orderKey
+	iv.isProduction = true
+	for i := range iv.events {
+		iv.events[i].orderKey = orderKey
+	}
+	for i := range iv.stateDurations {
+		iv.stateDurations[i].orderKey = orderKey
+	}
+	for i := range iv.stepDwells {
+		iv.stepDwells[i].orderKey = orderKey
+	}
+	for i := range iv.stepActuators {
+		iv.stepActuators[i].orderKey = orderKey
+	}
+	for i := range iv.faults {
+		iv.faults[i].orderKey = orderKey
+	}
+	for i := range iv.toggles {
+		iv.toggles[i].orderKey = orderKey
+	}
+	for i := range iv.configs {
+		iv.configs[i].orderKey = orderKey
+	}
+	for i := range iv.doorEvents {
+		iv.doorEvents[i].orderKey = orderKey
+	}
+}
+
 func (t *tracker) resetPerInterval() {
 	t.dwellSeq = map[string]int64{}
 }
 
 // closeInterval finalises the open interval and moves it to the pending-write queue.
-// A zero-length interval is dropped rather than emitted — it carries no information and
-// would only add noise.
+// An empty synthetic interval with no children is dropped. A production interval, or any
+// interval that already has step dwells, is kept even when close lands on the same
+// millisecond as open — sub-millisecond AutoCycle steps are still real steps.
 func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 	if t.current == nil {
 		return
@@ -298,12 +382,15 @@ func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 	t.closeOpenStateSpan(atMS, "interval_end")
 
 	iv := t.current
+	if atMS < iv.startedMS {
+		atMS = iv.startedMS
+	}
 	iv.endedMS = atMS
 	if forcedResult != "" {
 		iv.result = forcedResult
 	}
-	if iv.endedMS <= iv.startedMS {
-		// Keep the tracker consistent even when we drop the row.
+	if iv.endedMS == iv.startedMS && !iv.isProduction && len(iv.stepDwells) == 0 &&
+		len(iv.events) == 0 && len(iv.faults) == 0 {
 		t.current = nil
 		return
 	}
@@ -517,12 +604,13 @@ func (t *tracker) closeDwell(lane string, atMS int64) {
 		return
 	}
 	delete(t.openDwells, lane)
-	if atMS <= d.startedMS {
-		return
+	if atMS < d.startedMS {
+		atMS = d.startedMS
 	}
 	if !emitsDwell(d.state, t.current.isProduction) {
 		// Dropped here rather than at flush so a long idle stretch does not buffer tens of
-		// thousands of rows in memory first.
+		// thousands of rows in memory first. This is an idle-state filter, not a duration
+		// filter: a 3ms AutoCycle step on an order is kept.
 		return
 	}
 	t.current.stepDwells = append(t.current.stepDwells, outStepDwell{
@@ -700,12 +788,19 @@ func (t *tracker) applyStepRunFault(sr srcStepRun, startMS, endMS int64, seq int
 // ApplyStepRun ingests one completed step as the controller recorded it. Used instead of
 // trackDwell on branches carrying fsm_step_runs — the row is already closed and already
 // carries what we would otherwise have to derive, plus per-step actuator attribution.
+//
+// Zero-length dwells are kept. UnixMilli truncates, so a 3ms AutoCycle step often has
+// startMS == endMS; dropping those hid steps 1 and 5 of a live order. Inverted times
+// (end before start) are clamped rather than skipped.
 func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuator) {
 	startMS := sr.Started.UnixMilli()
 	endMS := sr.Ended.UnixMilli()
+	if endMS < startMS {
+		endMS = startMS
+	}
 	t.ensureInterval(sr.OrderKey, sr.CurrentState, startMS)
 	iv := t.current
-	if iv == nil || endMS <= startMS {
+	if iv == nil {
 		return
 	}
 

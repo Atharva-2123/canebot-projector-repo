@@ -42,7 +42,7 @@ ExecStart=${ROOT}/projector/projector \\
   -source ${SOURCE_DB} \\
   -replica ${ROOT}/projector/canebot_replica.db \\
   -state ${ROOT}/projector/projector_state.db \\
-  -interval 5s -batch 2000 -retention 336h
+  -interval 5s -batch 2000 -retention 48h
 Restart=always
 RestartSec=10s
 StandardOutput=journal

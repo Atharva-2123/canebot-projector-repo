@@ -194,9 +194,11 @@ func stepTitle(state string, step *int64) string {
 }
 
 // downtimeStates are the states that count against availability.
+//
+// Maintenance is matched by prefix: the firmware writes "Maintenance_regular" /
+// "Maintenance_auto_cip_cmd3", never a bare "Maintenance". See isMaintenanceState.
 func isDowntimeState(state string) int64 {
-	switch state {
-	case "Error", "Maintenance":
+	if state == "Error" || isMaintenanceState(state) {
 		return 1
 	}
 	return 0

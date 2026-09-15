@@ -91,7 +91,7 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 	rows, err := p.rep.db.QueryContext(ctx,
 		`SELECT entered_at_ms, exited_at_ms, order_id
 		   FROM state_durations
-		  WHERE state = 'Maintenance' AND exited_at_ms > ? AND exited_at_ms <= ?
+		  WHERE state LIKE 'Maintenance%' AND exited_at_ms > ? AND exited_at_ms <= ?
 		  ORDER BY exited_at_ms`, last, upToMS)
 	if err != nil {
 		return fmt.Errorf("read maintenance spans: %w", err)
@@ -134,7 +134,7 @@ func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
 		if err := p.rep.db.QueryRowContext(ctx,
 			`SELECT EXISTS(
 			   SELECT 1 FROM step_dwells
-			    WHERE state = 'Maintenance' AND step = ?
+			    WHERE state LIKE 'Maintenance%' AND step = ?
 			      AND started_at_ms >= ? AND started_at_ms < ?
 			   UNION ALL
 			   SELECT 1 FROM cycles
@@ -563,12 +563,12 @@ func (p *projector) stateOccupancy(ctx context.Context, bucketStart, bucketEnd i
 		if ms <= 0 {
 			continue
 		}
-		switch state {
-		case "AutoCycle":
+		switch {
+		case state == "AutoCycle":
 			o.run += ms
-		case "Error":
+		case state == "Error":
 			o.errored += ms
-		case "Maintenance":
+		case isMaintenanceState(state):
 			o.maintenance += ms
 		default: // HomeIdle, Manual, and anything the firmware adds later
 			o.idle += ms

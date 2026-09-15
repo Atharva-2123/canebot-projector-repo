@@ -1364,7 +1364,15 @@ func TestSnapshotReachesTheReplicaAsBits(t *testing.T) {
 // back out. reachComplete controls whether step 7 ("CIP cycle complete") is reached.
 func seedMaintenanceCIP(t *testing.T, db *sql.DB, start time.Time, reachComplete bool) time.Time {
 	t.Helper()
-	seedTransition(t, db, "", "HomeIdle", "Maintenance", start)
+	return seedMaintenanceCIPState(t, db, start, reachComplete, "Maintenance")
+}
+
+// seedMaintenanceCIPState is seedMaintenanceCIP with the state name spelled out, so a test can
+// use the names the firmware actually writes rather than the bare "Maintenance" the projector
+// used to assume.
+func seedMaintenanceCIPState(t *testing.T, db *sql.DB, start time.Time, reachComplete bool, state string) time.Time {
+	t.Helper()
+	seedTransition(t, db, "", "HomeIdle", state, start)
 	steps := []int{0, 10, 1, 2, 3, 4, 5, 6}
 	if reachComplete {
 		steps = append(steps, cipCompleteStep)
@@ -1372,11 +1380,51 @@ func seedMaintenanceCIP(t *testing.T, db *sql.DB, start time.Time, reachComplete
 	at := start
 	for i, s := range steps {
 		at = start.Add(time.Duration(i+1) * 30 * time.Second)
-		seedStep(t, db, "", "Maintenance", s, s, at)
+		seedStep(t, db, "", state, s, s, at)
 	}
 	end := at.Add(30 * time.Second)
-	seedTransition(t, db, "", "Maintenance", "HomeIdle", end)
+	seedTransition(t, db, "", state, "HomeIdle", end)
 	return end
+}
+
+// TestCIPRunEmittedFromSuffixedMaintenanceState pins the state names the firmware ACTUALLY
+// writes. It never writes a bare "Maintenance" — it writes the variant that triggered the
+// clean, and the suffix is the trigger: "_regular" for the counter/operator path,
+// "_auto_cip_cmd3" for the auto CIP command.
+//
+// Every bare-literal comparison therefore matched nothing, and did so silently: a live machine
+// that had completed two full cleans reported cip_runs = 0, its maintenance time was billed to
+// idle, is_downtime stayed 0 across both, and cycles.result never held "maintenance". The
+// original test passed throughout because it seeded the literal the code was looking for.
+func TestCIPRunEmittedFromSuffixedMaintenanceState(t *testing.T) {
+	for _, state := range []string{"Maintenance_regular", "Maintenance_auto_cip_cmd3"} {
+		t.Run(state, func(t *testing.T) {
+			sourcePath, db := newSourceDB(t)
+
+			end := seedMaintenanceCIPState(t, db, base.Add(time.Minute), true, state)
+			seedTransition(t, db, "", "HomeIdle", "AutoCycle", end.Add(2*time.Minute))
+
+			rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+			if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cip_runs`); n != 1 {
+				t.Fatalf("cip_runs = %d, want 1 for state %q", n, state)
+			}
+			if c := scalarInt(t, rep, `SELECT completed FROM cip_runs`); c != 1 {
+				t.Errorf("completed = %d, want 1 — step %d was reached in %q",
+					c, cipCompleteStep, state)
+			}
+			// resultForState fed the same bare literal, so the span was filed as idle.
+			if r := scalarStr(t, rep,
+				`SELECT result FROM cycles WHERE result = 'maintenance' LIMIT 1`); r != "maintenance" {
+				t.Errorf("cycles.result = %q, want \"maintenance\" for %q", r, state)
+			}
+			// Maintenance is downtime; a clean that reads as uptime inflates availability.
+			if d := scalarInt(t, rep,
+				`SELECT is_downtime FROM state_durations WHERE state = ? LIMIT 1`, state); d != 1 {
+				t.Errorf("is_downtime = %d, want 1 for %q", d, state)
+			}
+		})
+	}
 }
 
 // TestCIPRunEmittedFromMaintenanceSpan: Maintenance IS the CIP cycle in this firmware, so a
@@ -2014,5 +2062,107 @@ func TestOldRollupTablesAreFoldedIn(t *testing.T) {
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hourly_rollups'`); n != 0 {
 		t.Error("hourly_rollups still exists; a table the projector no longer writes would " +
 			"keep its replication cursor and look like a live but frozen feed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Keep every AutoCycle step on an order, including sub-millisecond dwells
+// ---------------------------------------------------------------------------
+
+func ptrInt(v int) *int { return &v }
+
+// A 3ms step run collapses to startMS == endMS after UnixMilli. That used to be dropped,
+// so MAIN FSM for a drink started at step 10 and skipped 1 and 5.
+func TestSubMillisecondStepRunsAreKeptOnTheOrder(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	const orderKey = "ORD-4ab81a39a7d9"
+	start := base
+
+	seedOrder(t, db, orderKey, 1, start)
+	// Identical timestamps: UnixMilli(start) == UnixMilli(end). The old filter dropped these.
+	seedStepRun(t, db, orderKey, "AutoCycle", 1,
+		start.Add(2*time.Millisecond), start.Add(2*time.Millisecond),
+		"AutoCycle", ptrInt(0), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", 5,
+		start.Add(5*time.Millisecond), start.Add(5*time.Millisecond),
+		"AutoCycle", ptrInt(1), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", 9,
+		start.Add(10*time.Millisecond), start.Add(2410*time.Millisecond),
+		"AutoCycle", ptrInt(5), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", 10,
+		start.Add(2410*time.Millisecond), start.Add(46*time.Second),
+		"AutoCycle", ptrInt(9), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", autoCycleCompleteStep,
+		start.Add(47*time.Second), start.Add(47*time.Second+5*time.Millisecond),
+		"AutoCycle", ptrInt(10), "")
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	var steps []int
+	rows, err := rep.Query(`SELECT step FROM step_dwells WHERE order_id=? AND lane=? ORDER BY seq_index`,
+		orderKey, laneMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s int
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		steps = append(steps, s)
+	}
+	want := []int{1, 5, 9, 10, autoCycleCompleteStep}
+	if len(steps) != len(want) {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+	for i := range want {
+		if steps[i] != want[i] {
+			t.Fatalf("steps = %v, want %v", steps, want)
+		}
+	}
+}
+
+// fsm_events often carry a blank order_key even during AutoCycle. Those used to steal the
+// production interval into IDLE, and UNIQUE(order_id) then kept only the later fragment
+// (from step 10 onward).
+func TestBlankOrderKeyEventsDoNotDropEarlySteps(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	const orderKey = "ORD-early01"
+	start := base
+
+	seedOrder(t, db, orderKey, 1, start)
+	// Same instant as the live machine: AutoCycle events with no order_key just after the order.
+	seedStep(t, db, "", "AutoCycle", 0, 1, start.Add(2*time.Millisecond))
+	seedStep(t, db, "", "AutoCycle", 1, 5, start.Add(5*time.Millisecond))
+	seedStepRun(t, db, orderKey, "AutoCycle", 1,
+		start.Add(2*time.Millisecond), start.Add(5*time.Millisecond),
+		"AutoCycle", ptrInt(0), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", 9,
+		start.Add(10*time.Millisecond), start.Add(2410*time.Millisecond),
+		"AutoCycle", ptrInt(5), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", 10,
+		start.Add(2410*time.Millisecond), start.Add(5*time.Second),
+		"AutoCycle", ptrInt(9), "")
+	seedStepRun(t, db, orderKey, "AutoCycle", autoCycleCompleteStep,
+		start.Add(6*time.Second), start.Add(6*time.Second+2*time.Millisecond),
+		"AutoCycle", ptrInt(10), "")
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	if n := scalarInt(t, rep, `SELECT COUNT(*) FROM cycles WHERE order_id=?`, orderKey); n != 1 {
+		t.Fatalf("cycles for %s = %d, want 1 (blank-key events must not split the drink)", orderKey, n)
+	}
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND step=1`, orderKey); n != 1 {
+		t.Errorf("step 1 dwells = %d, want 1", n)
+	}
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND step=9`, orderKey); n != 1 {
+		t.Errorf("step 9 dwells = %d, want 1", n)
+	}
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND step=10`, orderKey); n != 1 {
+		t.Errorf("step 10 dwells = %d, want 1", n)
 	}
 }

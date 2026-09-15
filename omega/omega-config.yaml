@@ -12,7 +12,7 @@ connection:
       client_cert_path: /home/pi/projector/canebot-projector-repo/omega/certs/device.crt
       client_key_path: /home/pi/projector/canebot-projector-repo/omega/certs/device.key
 modules:
-  required: [sqlite-replication, heartbeat]
+  required: [sqlite-replication]
 security:
   # 1 MiB. This value is load-bearing in both directions.
   #
@@ -38,7 +38,7 @@ security:
   max_payload_bytes: 262144
   capabilities:
     sqlite-replication: true
-    heartbeat: true
+    heartbeat: false
 sqlite-replication:
   # The PROJECTOR'S OUTPUT, never the machine's own config.db — omega must not open the
   # controller's database. Matches -replica in linux/install-services.sh.
