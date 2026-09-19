@@ -379,7 +379,17 @@ func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 	}
 	// Close anything still open inside it, so no dwell or state span is lost.
 	t.closeOpenDwells(atMS)
+	carry := t.openState
 	t.closeOpenStateSpan(atMS, "interval_end")
+	// The machine is still in that state; only the interval changed. Without this the span
+	// stays closed until the next FSM event, and when the switch came from a toggle, a fault
+	// or an order, everything between went unrecorded (state_durations on 19 Sep has no row
+	// for 11:06:59–11:07:11, with the machine in Manual throughout).
+	// Only when it actually closed: a row arriving late can close the interval before the span
+	// began, and replacing the span then would start it earlier and overlap its predecessor.
+	if carry != nil && t.openState == nil {
+		t.openState = &openStateSpan{state: carry.state, enteredMS: atMS, entryReason: "interval_start"}
+	}
 
 	iv := t.current
 	if atMS < iv.startedMS {
@@ -489,8 +499,33 @@ func (t *tracker) trackStateSpan(e srcFSMEvent, atMS int64) {
 	if t.openState.state == state {
 		return
 	}
+	if isStaleStateSample(t.openState, e, atMS) {
+		return
+	}
 	t.closeStateSpanAt(atMS, e.EventKind)
 	t.openState = &openStateSpan{state: state, enteredMS: atMS, entryReason: e.EventKind}
+}
+
+// staleSampleWindowMS bounds how long after a state_transition a non-transition event may
+// still be carrying the state the machine just left.
+const staleSampleWindowMS = 1000
+
+// isStaleStateSample reports whether e is a non-transition event whose CurrentState was
+// sampled before the transition that opened the current span.
+//
+// Every fault writes two rows in the same instant: `state_transition AutoCycle→Error`, and
+// `event_sent FaultDetected` stamped with the CurrentState its sender read — AutoCycle, since
+// the transition had not happened yet. Which of the two carries the later timestamp is a race
+// (fault 149 on 19 Sep: event_sent first; fault 147 the night before: second). When it came
+// second it replaced the Error span with AutoCycle, and with no further transition for 40
+// minutes, state_durations reported a faulted machine as running and is_downtime read 0.
+//
+// Only a state_transition moves the machine to another state. Any other event reporting a
+// different state within a second of one is describing the state before it.
+func isStaleStateSample(open *openStateSpan, e srcFSMEvent, atMS int64) bool {
+	return e.EventKind != "state_transition" &&
+		open.entryReason == "state_transition" &&
+		atMS-open.enteredMS < staleSampleWindowMS
 }
 
 func (t *tracker) closeStateSpanAt(atMS int64, reason string) {

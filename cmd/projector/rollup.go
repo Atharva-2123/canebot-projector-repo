@@ -67,7 +67,11 @@ func (p *projector) emitDerived(ctx context.Context, upToMS int64) error {
 	if err := p.emitHourly(ctx, upToMS); err != nil {
 		return err
 	}
-	return p.emitDaily(ctx, upToMS)
+	if err := p.emitDaily(ctx, upToMS); err != nil {
+		return err
+	}
+	// Last, so nothing already shipping waits on it.
+	return p.emitFaultIncidents(ctx)
 }
 
 // ---------------------------------------------------------------------------

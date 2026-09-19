@@ -851,7 +851,7 @@ func (w *replicaWriter) Prune(ctx context.Context, olderThan time.Time) error {
 	cutoff := eventTS(olderThan.UnixMilli())
 	tables := []string{"sensor_toggles", "config_history", "state_durations",
 		"step_dwells", "fault_events", "actuator_intervals", "cip_runs",
-		"door_events", "rollups", "gaps"}
+		"door_events", "fault_incidents", "rollups", "gaps"}
 	var errs []error
 	for _, t := range tables {
 		if _, err := w.db.ExecContext(ctx,

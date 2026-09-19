@@ -234,6 +234,46 @@ CREATE TABLE IF NOT EXISTS door_events (
     date_utc             TEXT    NOT NULL
 );
 
+-- One row per fault incident, emitted once the machine has recovered from it.
+--
+-- An incident runs from a fault until the machine is back to normal work: it enters HomeIdle,
+-- or a drink reaches AutoCycle step 19. Every fault raised in between belongs to it, which is
+-- what folds the re-raises a door close without a reset produces (seven fault_events rows on
+-- 18 Sep, one breakdown) into the single stretch of downtime they actually were.
+--
+-- fault_events cannot carry this. Its rows ship once, when the fault is raised, and both
+-- destinations append rather than upsert — so a resolution written back onto a fault row would
+-- never leave the device, and re-emitting the row would duplicate the fault in the cloud.
+--
+-- No foreign key to cycles: an incident longer than the replica retention would outlive its
+-- cycle row, and a failing insert here would stall the whole tick.
+CREATE TABLE IF NOT EXISTS fault_incidents (
+    id                     INTEGER PRIMARY KEY,
+    event_ts               TEXT    NOT NULL,   -- recovered
+    raised_at_ms           INTEGER NOT NULL,   -- the first fault
+    recovered_at_ms        INTEGER NOT NULL,
+    downtime_ms            INTEGER NOT NULL,   -- raised → recovered; the MTTR numerator
+    recovered_via          TEXT    NOT NULL,   -- home_idle | cycle_complete
+    order_id               TEXT,               -- the first fault's
+    fault_key              TEXT    NOT NULL UNIQUE,  -- the first fault's
+    fault_type             TEXT    NOT NULL,
+    severity               TEXT    NOT NULL,
+    fault_count            INTEGER NOT NULL,   -- faults raised before recovery, re-raises included
+    last_raised_at_ms      INTEGER NOT NULL,
+    first_reset_at_ms      INTEGER,            -- first X0.7 rising edge
+    reset_count            INTEGER NOT NULL,
+    first_door_open_at_ms  INTEGER,            -- response time = this − raised_at_ms
+    door_open_count        INTEGER NOT NULL,   -- per-episode times are in door_events
+    door_open_ms           INTEGER NOT NULL,
+    -- Where the downtime went. Spans are clipped to the incident, so these four plus any
+    -- projector gap sum to downtime_ms.
+    error_ms               INTEGER NOT NULL,
+    manual_ms              INTEGER NOT NULL,
+    maintenance_ms         INTEGER NOT NULL,
+    run_ms                 INTEGER NOT NULL,   -- AutoCycle resumed and re-faulted
+    date_utc               TEXT    NOT NULL    -- of raised_at_ms
+);
+
 CREATE TABLE IF NOT EXISTS cip_runs (
     id             INTEGER PRIMARY KEY,
     event_ts       TEXT    NOT NULL,           -- ended
@@ -356,6 +396,10 @@ CREATE INDEX IF NOT EXISTS idx_actuator_intervals_ord ON actuator_intervals(orde
 CREATE INDEX IF NOT EXISTS idx_cip_runs_order         ON cip_runs(order_id);
 CREATE INDEX IF NOT EXISTS idx_door_events_ts         ON door_events(event_ts);
 CREATE INDEX IF NOT EXISTS idx_door_events_order      ON door_events(order_id);
+CREATE INDEX IF NOT EXISTS idx_door_events_opened     ON door_events(opened_at_ms);
+CREATE INDEX IF NOT EXISTS idx_fault_incidents_ts     ON fault_incidents(event_ts);
+CREATE INDEX IF NOT EXISTS idx_fault_events_raised    ON fault_events(raised_at_ms);
+CREATE INDEX IF NOT EXISTS idx_state_durations_enter  ON state_durations(state, entered_at_ms);
 CREATE INDEX IF NOT EXISTS idx_sensor_toggles_ts      ON sensor_toggles(event_ts);
 CREATE INDEX IF NOT EXISTS idx_sensor_toggles_order   ON sensor_toggles(order_id, event_at_ms);
 CREATE INDEX IF NOT EXISTS idx_config_history_order   ON config_history(order_id);
