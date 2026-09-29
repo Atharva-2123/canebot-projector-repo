@@ -243,15 +243,36 @@ type tracker struct {
 	// intervals, mostly). Written directly, since the FK parent already exists.
 	lateActuators []outActuatorInterval
 
+	// closedOrders remembers the last few production orders after they close, so a step run
+	// arriving for one of them late is written to that order instead of closing whatever
+	// interval is open now. See applyLateStepRun.
+	closedOrders    map[string]*closedOrder
+	closedOrderKeys []string // oldest first, bounded by maxClosedOrders
+
 	synthCounter int64
 }
 
+// closedOrder is what a late child row needs from an order whose interval already closed:
+// the context the writer denormalises onto children, and where its dwell numbering got to.
+type closedOrder struct {
+	startedMS, endedMS int64
+	result             string
+	recipeID           *int64
+	glassCount         *int64
+	dwellSeq           map[string]int64
+}
+
+// A late row trails its order by milliseconds (the step-19 run ends as the next order starts),
+// so only the most recent orders are ever needed.
+const maxClosedOrders = 8
+
 func newTracker(severity func(string) string) *tracker {
 	return &tracker{
-		severity:   severity,
-		openDwells: map[string]*openDwell{},
-		openFaults: map[string]*openFault{},
-		dwellSeq:   map[string]int64{},
+		severity:     severity,
+		openDwells:   map[string]*openDwell{},
+		openFaults:   map[string]*openFault{},
+		dwellSeq:     map[string]int64{},
+		closedOrders: map[string]*closedOrder{},
 	}
 }
 
@@ -309,12 +330,21 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 		return
 	}
 
+	// The first AutoCycle row starts a fresh interval rather than joining the idle one. That
+	// interval is the prelude the order adopts above; joining would hand the order the whole
+	// idle stretch as its start, and an order begun 14.5 min into idle then hit the cap
+	// mid-drink and was closed `aborted` (ORD-61d9a47bfa45, 28 Sep).
 	want := resultForState(state)
-	if t.current != nil && !t.current.isProduction && t.current.result == want {
+	if t.current != nil && !t.current.isProduction && t.current.result == want &&
+		(state != "AutoCycle" || t.current.isAutoCyclePrelude()) {
 		return
 	}
 	t.closeInterval(atMS, "")
 	t.current = newInterval(t.nextSynthKey(want, atMS), false, atMS, want)
+	if state == "AutoCycle" {
+		// Marked here so a step run (which records no uniqueStates) cannot split it again.
+		t.current.uniqueStates["AutoCycle"] = struct{}{}
+	}
 	t.resetPerInterval()
 }
 
@@ -407,6 +437,32 @@ func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 	iv.dominantFaultType = dominantKey(iv.faultTypeCounts)
 	t.closed = append(t.closed, iv)
 	t.current = nil
+	if iv.isProduction {
+		t.rememberClosedOrder(iv)
+	}
+}
+
+// rememberClosedOrder records a production interval as it closes. The first close wins, as it
+// does in the replica (cycles upserts on order_id and keeps the first row); a later fragment of
+// the same order only moves the dwell numbering on.
+func (t *tracker) rememberClosedOrder(iv *interval) {
+	if c, ok := t.closedOrders[iv.orderKey]; ok {
+		c.dwellSeq = t.dwellSeq
+		return
+	}
+	t.closedOrders[iv.orderKey] = &closedOrder{
+		startedMS:  iv.startedMS,
+		endedMS:    iv.endedMS,
+		result:     iv.result,
+		recipeID:   iv.recipeID,
+		glassCount: iv.glassCount,
+		dwellSeq:   t.dwellSeq,
+	}
+	t.closedOrderKeys = append(t.closedOrderKeys, iv.orderKey)
+	if len(t.closedOrderKeys) > maxClosedOrders {
+		delete(t.closedOrders, t.closedOrderKeys[0])
+		t.closedOrderKeys = t.closedOrderKeys[1:]
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -771,8 +827,7 @@ func (t *tracker) ledgerCovers(faultType string, startMS, endMS int64) bool {
 // The fault is stamped at the dwell's END: the firmware sends FaultDetected, which flushes
 // this session and transitions to Error, so the step ended because of the fault. That is the
 // closest instant the row actually pins down.
-func (t *tracker) applyStepRunFault(sr srcStepRun, startMS, endMS int64, seq int64) bool {
-	iv := t.current
+func (t *tracker) applyStepRunFault(iv *interval, sr srcStepRun, startMS, endMS int64, seq int64) bool {
 	if iv == nil || sr.FaultType == "" || !t.stepRunFaults {
 		return false
 	}
@@ -809,7 +864,8 @@ func (t *tracker) applyStepRunFault(sr srcStepRun, startMS, endMS int64, seq int
 		dwellSeqIndex: &seqIdx,
 	})
 
-	if !iv.isProduction {
+	if !iv.isProduction || iv != t.current {
+		// A detached late fragment records the fault but never closes the open interval.
 		return false
 	}
 	result := resultFaultedRecoverable
@@ -833,6 +889,10 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 	if endMS < startMS {
 		endMS = startMS
 	}
+	if t.isLateForClosedOrder(sr.OrderKey) {
+		t.applyLateStepRun(sr, actuators, startMS, endMS)
+		return
+	}
 	t.ensureInterval(sr.OrderKey, sr.CurrentState, startMS)
 	iv := t.current
 	if iv == nil {
@@ -848,7 +908,67 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 		// running position within the lane rather than silently renumbering.
 		return
 	}
+	appendStepRun(iv, sr, actuators, startMS, endMS, lane, seq)
 
+	// A fault on this row ended the cycle, so it is resolved before completion is considered:
+	// the two cannot both be true, and a fault is the stronger evidence.
+	if t.applyStepRunFault(iv, sr, startMS, endMS, seq) {
+		return
+	}
+
+	// Reaching AutoCycle step 19 closes the cycle — the firmware labels it "cycle complete"
+	// and increments the glass count there (fsm/autocycle.go).
+	//
+	// This has to be detected here as well as in ApplyFSMEvent: on a controller that records
+	// step runs but not fsm_events, this is the ONLY place completion is visible. Without it
+	// every production cycle stays open until the duration cap force-closes it as `aborted`,
+	// and a machine that is working perfectly reports nothing but failures.
+	if iv.isProduction && sr.CurrentState == "AutoCycle" && sr.Step == autoCycleCompleteStep {
+		t.closeInterval(endMS, resultCompleted)
+	}
+}
+
+// isLateForClosedOrder reports whether a row keyed to orderKey belongs to an order that has
+// already closed and is not the one open now.
+//
+// Step runs sit on the timeline at their END. When the firmware chains orders ("[Step 19]
+// Next order received"), the previous order's step-19 run ends at the instant the next order
+// starts — after that order's row has opened its interval. Routed through ensureInterval, the
+// late row closed the new order at birth (`aborted`, 0 events, 0 ms) and UNIQUE(order_id) kept
+// that empty row over the real drink. Eleven drinks on 28 Sep read as failed this way.
+func (t *tracker) isLateForClosedOrder(orderKey string) bool {
+	if orderKey == "" {
+		return false
+	}
+	if _, ok := t.closedOrders[orderKey]; !ok {
+		return false
+	}
+	return t.current == nil || t.current.orderKey != orderKey
+}
+
+// applyLateStepRun writes a late step run to its own order without touching the open interval,
+// the open dwells or the state span. It goes out as a detached fragment carrying the closed
+// order's context: the fragment's cycles row is a no-op against the one already written (the
+// upsert keeps the first), and its dwell lands under the right order_id with the right
+// cycle_result and recipe.
+func (t *tracker) applyLateStepRun(sr srcStepRun, actuators map[string]StepRunActuator, startMS, endMS int64) {
+	c := t.closedOrders[sr.OrderKey]
+	lane := laneForState(sr.CurrentState)
+	seq := c.dwellSeq[lane]
+	c.dwellSeq[lane] = seq + 1
+
+	frag := newInterval(sr.OrderKey, true, c.startedMS, c.result)
+	frag.endedMS = c.endedMS
+	frag.recipeID = c.recipeID
+	frag.glassCount = c.glassCount
+	appendStepRun(frag, sr, actuators, startMS, endMS, lane, seq)
+	t.applyStepRunFault(frag, sr, startMS, endMS, seq)
+	t.closed = append(t.closed, frag)
+}
+
+// appendStepRun adds one step run's dwell and per-output actuator totals to iv.
+func appendStepRun(iv *interval, sr srcStepRun, actuators map[string]StepRunActuator,
+	startMS, endMS int64, lane string, seq int64) {
 	step := sr.Step
 	iv.stepDwells = append(iv.stepDwells, outStepDwell{
 		startedAtMS:   startMS,
@@ -909,23 +1029,6 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 			recipeStep:        recipeStep,
 			recipeOriginState: originState,
 		})
-	}
-
-	// A fault on this row ended the cycle, so it is resolved before completion is considered:
-	// the two cannot both be true, and a fault is the stronger evidence.
-	if t.applyStepRunFault(sr, startMS, endMS, seq) {
-		return
-	}
-
-	// Reaching AutoCycle step 19 closes the cycle — the firmware labels it "cycle complete"
-	// and increments the glass count there (fsm/autocycle.go).
-	//
-	// This has to be detected here as well as in ApplyFSMEvent: on a controller that records
-	// step runs but not fsm_events, this is the ONLY place completion is visible. Without it
-	// every production cycle stays open until the duration cap force-closes it as `aborted`,
-	// and a machine that is working perfectly reports nothing but failures.
-	if iv.isProduction && sr.CurrentState == "AutoCycle" && sr.Step == autoCycleCompleteStep {
-		t.closeInterval(endMS, resultCompleted)
 	}
 }
 

@@ -2166,3 +2166,86 @@ func TestBlankOrderKeyEventsDoNotDropEarlySteps(t *testing.T) {
 		t.Errorf("step 10 dwells = %d, want 1", n)
 	}
 }
+
+// Orders chained without returning to HomeIdle ("[Step 19] Next order received"): the
+// previous order's step-19 run ENDS at the instant the next order starts, and step runs sit on
+// the timeline at their end. That late row used to close the new order at birth — `aborted`,
+// 0 events, 0 ms — and UNIQUE(order_id) then discarded the real drink. Field case 28 Sep:
+// ORD-74f624fd2625 → ORD-fa5b6df4444c → ORD-7e8618260bcc …, every one of them made.
+func TestChainedOrderIsNotAbortedByPreviousStepRun(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	keys := []string{"ORD-chain00000a", "ORD-chain00000b", "ORD-chain00000c"}
+	const drink = 75 * time.Second
+
+	start := base
+	for i, key := range keys {
+		seedOrder(t, db, key, i+1, start)
+		seedStepRun(t, db, key, "AutoCycle", 0, start, start.Add(time.Millisecond), "AutoCycle", ptrInt(19), "")
+		for s := 0; s < autoCycleCompleteStep; s++ {
+			seedStep(t, db, key, "AutoCycle", s, s+1, start.Add(time.Duration(s+1)*drink/autoCycleCompleteStep))
+		}
+		seedStepRun(t, db, key, "AutoCycle", 10,
+			start.Add(time.Second), start.Add(drink), "AutoCycle", ptrInt(9), "")
+		stepNineteen := start.Add(drink)
+		next := stepNineteen.Add(3 * time.Millisecond)
+		// Step 19 runs until the next order's step 0 begins.
+		seedStepRun(t, db, key, "AutoCycle", autoCycleCompleteStep,
+			stepNineteen, next, "AutoCycle", ptrInt(10), "")
+		start = next
+	}
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	for _, key := range keys {
+		if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, key); got != resultCompleted {
+			t.Errorf("%s result = %q, want %q", key, got, resultCompleted)
+		}
+		if n := scalarInt(t, rep, `SELECT fsm_event_count FROM cycles WHERE order_id=?`, key); n == 0 {
+			t.Errorf("%s fsm_event_count = 0, want the drink's events", key)
+		}
+		if d := scalarInt(t, rep, `SELECT duration_ms FROM cycles WHERE order_id=?`, key); d < 70_000 || d > 80_000 {
+			t.Errorf("%s duration_ms = %d, want ~75s", key, d)
+		}
+		// The late step-19 dwell still reaches its own order.
+		if n := scalarInt(t, rep,
+			`SELECT COUNT(*) FROM step_dwells WHERE order_id=? AND step=?`, key, autoCycleCompleteStep); n != 1 {
+			t.Errorf("%s step 19 dwells = %d, want 1", key, n)
+		}
+	}
+}
+
+// An order that starts late in an idle stretch used to take over the whole IDLE interval, so
+// it inherited the idle start, hit the 15-minute cap mid-drink and was force-closed `aborted`.
+// Field case: ORD-61d9a47bfa45 started 14.5 min into idle, completed at step 19 80s later.
+func TestOrderLateInIdleDoesNotInheritIdleStart(t *testing.T) {
+	sourcePath, db := newSourceDB(t)
+	const key = "ORD-lateidle0001"
+
+	seedTransition(t, db, "", "Manual", "HomeIdle", base)
+	for at := 30 * time.Second; at < 14*time.Minute+30*time.Second; at += 30 * time.Second {
+		seedStep(t, db, "", "HomeIdle", 8, 12, base.Add(at))
+	}
+	start := base.Add(14*time.Minute + 30*time.Second)
+	// The firmware enters AutoCycle a few ms before the order key is bound.
+	seedTransition(t, db, "", "HomeIdle", "AutoCycle", start)
+	seedOrder(t, db, key, 2, start.Add(3*time.Millisecond))
+	for s := 0; s < autoCycleCompleteStep; s++ {
+		seedStep(t, db, key, "AutoCycle", s, s+1, start.Add(time.Duration(s+1)*4*time.Second))
+	}
+
+	rep := openRO(t, runOnce(t, sourcePath, t.TempDir()))
+
+	if got := scalarStr(t, rep, `SELECT result FROM cycles WHERE order_id=?`, key); got != resultCompleted {
+		t.Errorf("result = %q, want %q", got, resultCompleted)
+	}
+	if got := scalarInt(t, rep, `SELECT started_at_ms FROM cycles WHERE order_id=?`, key); got < start.UnixMilli() {
+		t.Errorf("started_at_ms = %d, want >= %d (the order must not start in the idle before it)",
+			got, start.UnixMilli())
+	}
+	// The idle stretch is still accounted for, as its own row.
+	if n := scalarInt(t, rep,
+		`SELECT COUNT(*) FROM cycles WHERE is_production=0 AND result='idle' AND ended_at_ms <= ?`,
+		start.UnixMilli()); n == 0 {
+		t.Errorf("no idle row before the order")
+	}
+}
