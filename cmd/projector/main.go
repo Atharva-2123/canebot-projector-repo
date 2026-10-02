@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"sort"
@@ -82,6 +83,7 @@ func main() {
 		batchSize   = flag.Int("batch", defaultBatchSize, "max source rows read per table per tick")
 		retention   = flag.Duration("retention", 14*24*time.Hour, "how long to keep rows in the replica")
 		once        = flag.Bool("once", false, "run a single pass and exit (useful for tests and backfill)")
+		settle      = flag.Duration("settle", defaultSettle, "apply a source row only once it is this old, so every controller table has caught up to it (0: off)")
 		verboseFlag = flag.Bool("v", false, "verbose logging")
 
 		fsmLog          = flag.String("fsm-log", "", "controller stdout log to tail into fsm_logs (empty: off, and the table is never created)")
@@ -97,7 +99,7 @@ func main() {
 
 	if err := runWith(options{
 		sourcePath: *sourcePath, replicaPath: *replicaPath, statePath: *statePath,
-		interval: *interval, batchSize: *batchSize, retention: *retention, once: *once,
+		interval: *interval, batchSize: *batchSize, retention: *retention, once: *once, settle: *settle,
 		fsmLogPath: *fsmLog, fsmLogRetention: *fsmLogRetention, fsmLogMaxAge: *fsmLogMaxAge,
 		fsmLogOmegaState: *fsmLogOmega, fsmLogDigest: *fsmLogDigest,
 		fsmLogPruneFile: *fsmLogPrune, fsmLogKeepBytes: int64(*fsmLogKeepMB) << 20,
@@ -112,6 +114,7 @@ type options struct {
 	batchSize                          int
 	retention                          time.Duration
 	once                               bool
+	settle                             time.Duration
 
 	fsmLogPath       string
 	fsmLogRetention  time.Duration
@@ -160,7 +163,11 @@ func runWith(o options) error {
 	}
 	defer rep.Close()
 
-	p := &projector{src: src, rep: rep, st: st, trk: newTracker(severityFor)}
+	p := &projector{src: src, rep: rep, st: st, trk: newTracker(severityFor), settle: o.settle}
+	if once {
+		// A -once run is a backfill or a test: everything in the source is already written.
+		p.settle = 0
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -326,7 +333,25 @@ type projector struct {
 	// once there is data through its end — otherwise a shutdown would stamp empty rollups on
 	// every hour since the last event and report an idle machine where we simply have no data.
 	lastTimelineMS int64
+
+	// settle holds back source rows younger than this. See tick.
+	settle time.Duration
+	now    func() time.Time // nil: time.Now; tests replay a clock
+
+	// Rows read but not yet applied (younger than the settle cutoff), and how far each table
+	// has been read. Held here so a row is read from the controller's database once, not once
+	// per tick for as long as it is settling. The persisted cursors still mark only what was
+	// applied, so a restart re-reads anything that was held.
+	held     []timelineItem
+	readUpTo map[string]int64
 }
+
+// defaultSettle covers the firmware's slowest writer: fsm_events are buffered and land in
+// batches about every 10s, while orders, step runs and faults are written at once. Applying a
+// row before every table has caught up to it is what reorders the timeline — the previous
+// drink's events arrive after the next drink's step runs and close it at birth. 30s is 3x the
+// flush period; the cost is that cycles reach the cloud 30s later.
+const defaultSettle = 30 * time.Second
 
 // Item kinds, ordered by the precedence they take when two rows share a timestamp. An order
 // must open its interval before the events that belong to it are applied.
@@ -362,10 +387,30 @@ type timelineItem struct {
 // Reads and writes are deliberately separated. Every source read closes its transaction
 // before any derivation happens, so our locks on the controller's database are held for
 // milliseconds rather than for the duration of the work.
-func (p *projector) tick(ctx context.Context) error {
+func (p *projector) tick(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			// Whatever was held may not have been applied; re-read it from the persisted
+			// cursors rather than skip it.
+			p.held, p.readUpTo = nil, nil
+		}
+	}()
 	items, safeUpTo, cursors, err := p.collect(ctx)
 	if err != nil {
 		return err
+	}
+	items = append(p.held, items...)
+	p.held = nil
+	// The settle window: rows younger than p.settle wait for the next tick. Every table has
+	// then been written up to the cutoff, so the merge below sees the machine's timeline in the
+	// order it happened rather than in the order the firmware happened to write it.
+	now := time.Now()
+	if p.now != nil {
+		now = p.now()
+	}
+	settledTo := now.Add(-p.settle)
+	if p.settle > 0 && (safeUpTo.IsZero() || settledTo.Before(safeUpTo)) {
+		safeUpTo = settledTo
 	}
 
 	sort.SliceStable(items, func(i, j int) bool {
@@ -382,8 +427,9 @@ func (p *projector) tick(ctx context.Context) error {
 	// safe-window rule is picked up on the next tick rather than skipped.
 	applied := map[string]int64{}
 	var latest time.Time
-	for _, it := range items {
+	for i, it := range items {
 		if !safeUpTo.IsZero() && it.at.After(safeUpTo) {
+			p.held = items[i:]
 			break
 		}
 		switch it.kind {
@@ -431,7 +477,17 @@ func (p *projector) tick(ctx context.Context) error {
 		}
 	}
 
-	if err := p.flushIntervals(ctx); err != nil {
+	// How far the timeline is known to be complete: what was applied, or — on a quiet machine
+	// with nothing to apply — the settle cutoff, since every row before it is in. Holding a
+	// row must never depend on another row arriving.
+	timelineMS := p.lastTimelineMS
+	if !latest.IsZero() {
+		timelineMS = latest.UnixMilli()
+	}
+	if ms := settledTo.UnixMilli(); ms > timelineMS {
+		timelineMS = ms
+	}
+	if err := p.flushIntervals(ctx, timelineMS); err != nil {
 		return err
 	}
 	// Actuator intervals come last: they attach to a cycle, so the parent should exist.
@@ -474,6 +530,16 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 		}
 		cursors[t] = id
 	}
+	if p.readUpTo == nil {
+		p.readUpTo = map[string]int64{}
+	}
+	// from is where to resume reading a table: past what is held as well as what is applied.
+	from := func(table string) int64 {
+		if r := p.readUpTo[table]; r > cursors[table] {
+			return r
+		}
+		return cursors[table]
+	}
 
 	noteFull := func(full bool, last time.Time) {
 		if !full {
@@ -484,7 +550,7 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 		}
 	}
 
-	orders, err := p.src.OrdersAfter(ctx, cursors["orders"])
+	orders, err := p.src.OrdersAfter(ctx, from("orders"))
 	if err != nil {
 		return nil, time.Time{}, nil, err
 	}
@@ -493,9 +559,10 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 	}
 	if n := len(orders); n > 0 {
 		noteFull(n >= p.src.batchSize, orders[n-1].TS)
+		p.readUpTo["orders"] = orders[n-1].ID
 	}
 
-	events, err := p.src.FSMEventsAfter(ctx, cursors["fsm_events"])
+	events, err := p.src.FSMEventsAfter(ctx, from("fsm_events"))
 	if err != nil {
 		return nil, time.Time{}, nil, err
 	}
@@ -504,9 +571,10 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 	}
 	if n := len(events); n > 0 {
 		noteFull(n >= p.src.batchSize, events[n-1].TS)
+		p.readUpTo["fsm_events"] = events[n-1].ID
 	}
 
-	faults, err := p.src.FaultsAfter(ctx, cursors["faults"])
+	faults, err := p.src.FaultsAfter(ctx, from("faults"))
 	if err != nil {
 		return nil, time.Time{}, nil, err
 	}
@@ -515,9 +583,10 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 	}
 	if n := len(faults); n > 0 {
 		noteFull(n >= p.src.batchSize, faults[n-1].TS)
+		p.readUpTo["faults"] = faults[n-1].ID
 	}
 
-	toggles, err := p.src.SensorTogglesAfter(ctx, cursors["sensor_input_toggles"])
+	toggles, err := p.src.SensorTogglesAfter(ctx, from("sensor_input_toggles"))
 	if err != nil {
 		return nil, time.Time{}, nil, err
 	}
@@ -526,6 +595,7 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 	}
 	if n := len(toggles); n > 0 {
 		noteFull(n >= p.src.batchSize, toggles[n-1].TS)
+		p.readUpTo["sensor_input_toggles"] = toggles[n-1].ID
 	}
 
 	if p.trk.useStepRuns {
@@ -534,7 +604,7 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 			return nil, time.Time{}, nil, cErr
 		}
 		cursors["fsm_step_runs"] = id
-		runs, rErr := p.src.StepRunsAfter(ctx, id)
+		runs, rErr := p.src.StepRunsAfter(ctx, from("fsm_step_runs"))
 		if rErr != nil {
 			return nil, time.Time{}, nil, rErr
 		}
@@ -545,6 +615,7 @@ func (p *projector) collect(ctx context.Context) (items []timelineItem, safeUpTo
 		}
 		if n := len(runs); n > 0 {
 			noteFull(n >= p.src.batchSize, runs[n-1].Ended)
+			p.readUpTo["fsm_step_runs"] = runs[n-1].ID
 		}
 	}
 
@@ -683,7 +754,7 @@ func (p *projector) finalFlush(ctx context.Context) error {
 		closeAt = now
 	}
 	p.trk.FlushOpen(closeAt)
-	if err := p.flushIntervals(ctx); err != nil {
+	if err := p.flushIntervals(ctx, math.MaxInt64); err != nil {
 		return err
 	}
 	// Derived tables run again here because the interval closed just above is the one holding
@@ -693,8 +764,8 @@ func (p *projector) finalFlush(ctx context.Context) error {
 	return p.emitDerived(ctx, p.lastTimelineMS)
 }
 
-func (p *projector) flushIntervals(ctx context.Context) error {
-	for _, iv := range p.trk.PendingIntervals() {
+func (p *projector) flushIntervals(ctx context.Context, timelineMS int64) error {
+	for _, iv := range p.trk.PendingIntervals(timelineMS) {
 		if err := p.rep.FlushInterval(ctx, iv); err != nil {
 			return err
 		}

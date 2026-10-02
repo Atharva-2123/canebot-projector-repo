@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS cycles (
     state_transition_count INTEGER,
     unique_state_count     INTEGER,
     outcome                TEXT    NOT NULL DEFAULT '',
+    close_reason           TEXT    NOT NULL DEFAULT '', -- step19 | fault | next_order | cap
+                                                       -- | state_change | shutdown
     bucket_1m_ms           INTEGER NOT NULL DEFAULT 0,
     bucket_5m_ms           INTEGER NOT NULL DEFAULT 0,
     bucket_15m_ms          INTEGER NOT NULL DEFAULT 0,

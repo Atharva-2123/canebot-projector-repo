@@ -262,6 +262,12 @@ func migrateReplica(db *sql.DB) error {
 			     ELSE 'failed'
 			 END
 			 WHERE outcome = ''`},
+
+		// Why the interval closed. A made drink that reads as failed shows up here as a
+		// production row closed by something other than step19 or fault, instead of having to
+		// be reconstructed from the controller log. '' on rows written before this column.
+		{"cycles", "close_reason",
+			`ALTER TABLE cycles ADD COLUMN close_reason TEXT NOT NULL DEFAULT ''`, ""},
 	}
 
 	// Bucket keys, so a time series is a GROUP BY rather than a client-side loop.
@@ -525,9 +531,9 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		                     terminal_state, terminal_step,
 		                     fault_count, dominant_fault_type, first_fault_at_ms, last_fault_at_ms,
 		                     fsm_event_count, step_event_count, state_transition_count,
-		                     unique_state_count, outcome,
+		                     unique_state_count, outcome, close_reason,
 		                     bucket_1m_ms, bucket_5m_ms, bucket_15m_ms, date_utc)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(order_id) DO UPDATE SET
 		     recipe_id   = COALESCE(cycles.recipe_id,   excluded.recipe_id),
 		     glass_count = COALESCE(cycles.glass_count, excluded.glass_count)`,
@@ -536,7 +542,7 @@ func (w *replicaWriter) FlushInterval(ctx context.Context, iv *interval) error {
 		nullIfEmpty(iv.terminalState), iv.terminalStep,
 		iv.faultCount, nullIfEmpty(iv.dominantFaultType), iv.firstFaultMS, iv.lastFaultMS,
 		iv.fsmEventCount, iv.stepEventCount, iv.stateTransitionCount, len(iv.uniqueStates),
-		outcomeFor(iv.result, iv.isProduction),
+		outcomeFor(iv.result, iv.isProduction), iv.closeReason,
 		bucket1m(iv.startedMS), bucket5m(iv.startedMS), bucket15m(iv.startedMS),
 		dateUTC(iv.startedMS),
 	); err != nil {

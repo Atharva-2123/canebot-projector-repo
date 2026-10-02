@@ -69,6 +69,18 @@ const (
 	resultError                 = "error"
 )
 
+// Why an interval closed — cycles.close_reason. Only step19 and fault are positive evidence
+// about a drink; the rest say the tracker stopped it, and a production row closed by one of
+// them is the first place to look when a made drink reads as failed.
+const (
+	closeStep19      = "step19"       // AutoCycle reached step 19: the drink was made
+	closeFault       = "fault"        // a fault ended it
+	closeNextOrder   = "next_order"   // a different order started while this one was open
+	closeCap         = "cap"          // open longer than maxIntervalMS
+	closeStateChange = "state_change" // a synthetic interval whose machine state changed
+	closeShutdown    = "shutdown"     // the projector stopped (or a -once run ended)
+)
+
 // isMaintenanceState reports whether a firmware state name is a Maintenance (CIP) state.
 //
 // The firmware does NOT write a bare "Maintenance". It writes the variant that started the
@@ -174,6 +186,8 @@ type interval struct {
 
 	terminalState string
 	terminalStep  *int64
+	closeReason   string
+	detached      bool // a late fragment of an order whose own row is written elsewhere
 
 	faultCount        int
 	dominantFaultType string
@@ -256,7 +270,8 @@ type tracker struct {
 // the context the writer denormalises onto children, and where its dwell numbering got to.
 type closedOrder struct {
 	startedMS, endedMS int64
-	result             string
+	result             string // the first close, which is what cycles keeps
+	lastResult         string // the latest close; decides whether the drink can resume
 	recipeID           *int64
 	glassCount         *int64
 	dwellSeq           map[string]int64
@@ -302,7 +317,7 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 			// A production cycle open this long never completed normally.
 			forced = resultAborted
 		}
-		t.closeInterval(atMS, forced)
+		t.closeInterval(atMS, forced, closeCap)
 	}
 
 	if orderKey != "" {
@@ -317,9 +332,14 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 			t.current.adoptProduction(orderKey)
 			return
 		}
-		t.closeInterval(atMS, "")
+		t.closeInterval(atMS, "", closeNextOrder)
 		t.current = newInterval(orderKey, true, atMS, resultAborted)
 		t.resetPerInterval()
+		if c, ok := t.closedOrders[orderKey]; ok {
+			// The drink resuming after a recoverable fault: keep numbering its dwells where it
+			// left off, so seq_index stays unique within the order.
+			t.dwellSeq = c.dwellSeq
+		}
 		return
 	}
 
@@ -339,7 +359,7 @@ func (t *tracker) ensureInterval(orderKey, state string, atMS int64) {
 		(state != "AutoCycle" || t.current.isAutoCyclePrelude()) {
 		return
 	}
-	t.closeInterval(atMS, "")
+	t.closeInterval(atMS, "", closeStateChange)
 	t.current = newInterval(t.nextSynthKey(want, atMS), false, atMS, want)
 	if state == "AutoCycle" {
 		// Marked here so a step run (which records no uniqueStates) cannot split it again.
@@ -403,7 +423,7 @@ func (t *tracker) resetPerInterval() {
 // An empty synthetic interval with no children is dropped. A production interval, or any
 // interval that already has step dwells, is kept even when close lands on the same
 // millisecond as open — sub-millisecond AutoCycle steps are still real steps.
-func (t *tracker) closeInterval(atMS int64, forcedResult string) {
+func (t *tracker) closeInterval(atMS int64, forcedResult, reason string) {
 	if t.current == nil {
 		return
 	}
@@ -426,6 +446,7 @@ func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 		atMS = iv.startedMS
 	}
 	iv.endedMS = atMS
+	iv.closeReason = reason
 	if forcedResult != "" {
 		iv.result = forcedResult
 	}
@@ -448,12 +469,17 @@ func (t *tracker) closeInterval(atMS int64, forcedResult string) {
 func (t *tracker) rememberClosedOrder(iv *interval) {
 	if c, ok := t.closedOrders[iv.orderKey]; ok {
 		c.dwellSeq = t.dwellSeq
+		c.lastResult = iv.result
+		if iv.endedMS > c.endedMS {
+			c.endedMS = iv.endedMS
+		}
 		return
 	}
 	t.closedOrders[iv.orderKey] = &closedOrder{
 		startedMS:  iv.startedMS,
 		endedMS:    iv.endedMS,
 		result:     iv.result,
+		lastResult: iv.result,
 		recipeID:   iv.recipeID,
 		glassCount: iv.glassCount,
 		dwellSeq:   t.dwellSeq,
@@ -473,6 +499,12 @@ func (t *tracker) rememberClosedOrder(iv *interval) {
 // step 0, generates ORD-<hex12>, and writes the orders row (fsm/autocycle.go).
 func (t *tracker) ApplyOrder(o srcOrder) {
 	atMS := o.TS.UnixMilli()
+	if t.isLateForClosedOrder(o.OrderKey, atMS) {
+		frag := t.lateFragment(o.OrderKey)
+		recipe, qty := o.Recipe, o.Quantity
+		frag.recipeID, frag.glassCount = &recipe, &qty
+		return
+	}
 	t.ensureInterval(o.OrderKey, "AutoCycle", atMS)
 	if t.current != nil && t.current.orderKey == o.OrderKey {
 		recipe, qty := o.Recipe, o.Quantity
@@ -483,8 +515,14 @@ func (t *tracker) ApplyOrder(o srcOrder) {
 
 func (t *tracker) ApplyFSMEvent(e srcFSMEvent) {
 	atMS := e.TS.UnixMilli()
-	t.ensureInterval(e.OrderKey, e.CurrentState, atMS)
-	iv := t.current
+	late := t.isLateForClosedOrder(e.OrderKey, atMS)
+	var iv *interval
+	if late {
+		iv = t.lateFragment(e.OrderKey)
+	} else {
+		t.ensureInterval(e.OrderKey, e.CurrentState, atMS)
+		iv = t.current
+	}
 	if iv == nil {
 		return
 	}
@@ -505,9 +543,13 @@ func (t *tracker) ApplyFSMEvent(e srcFSMEvent) {
 		iv.stepEventCount++
 	}
 
-	t.trackStateSpan(e, atMS)
-	if !t.useStepRuns {
-		t.trackDwell(e, atMS)
+	// The state span and the open dwells are the timeline as it is now; a row from a closed
+	// order's past would rewind them.
+	if !late {
+		t.trackStateSpan(e, atMS)
+		if !t.useStepRuns {
+			t.trackDwell(e, atMS)
+		}
 	}
 
 	iv.events = append(iv.events, outFSMEvent{
@@ -533,9 +575,9 @@ func (t *tracker) ApplyFSMEvent(e srcFSMEvent) {
 	// Reaching step 19 in AutoCycle is the firmware's own "cycle complete" marker. It is
 	// the only positive evidence of success available — everything else would be inferring
 	// success from the absence of a fault, which is how the current dashboard gets it wrong.
-	if iv.isProduction && e.CurrentState == "AutoCycle" &&
+	if !late && iv.isProduction && e.CurrentState == "AutoCycle" &&
 		e.StepTo != nil && *e.StepTo == autoCycleCompleteStep {
-		t.closeInterval(atMS, resultCompleted)
+		t.closeInterval(atMS, resultCompleted, closeStep19)
 	}
 }
 
@@ -737,8 +779,19 @@ func (t *tracker) closeOpenDwells(atMS int64) {
 // terminal for the order it belongs to.
 func (t *tracker) ApplyFault(f srcFault) {
 	atMS := f.TS.UnixMilli()
-	t.ensureInterval(f.OrderKey, f.State, atMS)
-	iv := t.current
+	late := t.isLateForClosedOrder(f.OrderKey, atMS)
+	var iv *interval
+	deferred := false
+	if late {
+		if iv = t.deferredFaultTarget(f.OrderKey, f.Step, atMS); iv != nil {
+			deferred = true
+		} else {
+			iv = t.lateFragment(f.OrderKey)
+		}
+	} else {
+		t.ensureInterval(f.OrderKey, f.State, atMS)
+		iv = t.current
+	}
 	if iv == nil {
 		return
 	}
@@ -756,11 +809,9 @@ func (t *tracker) ApplyFault(f srcFault) {
 	ms := atMS
 	iv.lastFaultMS = &ms
 
-	if d := t.openDwells[laneMain]; d != nil {
-		d.faults++
-	}
 	var dwellSeq *int64
-	if d := t.openDwells[laneMain]; d != nil {
+	if d := t.openDwells[laneMain]; d != nil && !late {
+		d.faults++
 		s := d.seqIndex
 		dwellSeq = &s
 	}
@@ -777,12 +828,15 @@ func (t *tracker) ApplyFault(f srcFault) {
 		dwellSeqIndex: dwellSeq,
 	})
 
-	if iv.isProduction {
+	if deferred {
+		t.markDeferredFault(iv, severity)
+	}
+	if iv.isProduction && !late {
 		result := resultFaultedRecoverable
 		if severity == severityNonRecoverable {
 			result = resultFaultedNonRecoverable
 		}
-		t.closeInterval(atMS, result)
+		t.closeInterval(atMS, result, closeFault)
 	}
 }
 
@@ -872,7 +926,7 @@ func (t *tracker) applyStepRunFault(iv *interval, sr srcStepRun, startMS, endMS 
 	if severity == severityNonRecoverable {
 		result = resultFaultedNonRecoverable
 	}
-	t.closeInterval(endMS, result)
+	t.closeInterval(endMS, result, closeFault)
 	return true
 }
 
@@ -889,7 +943,7 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 	if endMS < startMS {
 		endMS = startMS
 	}
-	if t.isLateForClosedOrder(sr.OrderKey) {
+	if t.isLateForClosedOrder(sr.OrderKey, startMS) {
 		t.applyLateStepRun(sr, actuators, startMS, endMS)
 		return
 	}
@@ -924,26 +978,98 @@ func (t *tracker) ApplyStepRun(sr srcStepRun, actuators map[string]StepRunActuat
 	// every production cycle stays open until the duration cap force-closes it as `aborted`,
 	// and a machine that is working perfectly reports nothing but failures.
 	if iv.isProduction && sr.CurrentState == "AutoCycle" && sr.Step == autoCycleCompleteStep {
-		t.closeInterval(endMS, resultCompleted)
+		t.closeInterval(endMS, resultCompleted, closeStep19)
 	}
 }
 
 // isLateForClosedOrder reports whether a row keyed to orderKey belongs to an order that has
-// already closed and is not the one open now.
+// already closed, and so must be written to that order without touching the interval open now.
 //
-// Step runs sit on the timeline at their END. When the firmware chains orders ("[Step 19]
-// Next order received"), the previous order's step-19 run ends at the instant the next order
-// starts — after that order's row has opened its interval. Routed through ensureInterval, the
-// late row closed the new order at birth (`aborted`, 0 events, 0 ms) and UNIQUE(order_id) kept
-// that empty row over the real drink. Eleven drinks on 28 Sep read as failed this way.
-func (t *tracker) isLateForClosedOrder(orderKey string) bool {
+// The firmware does not write its tables together: orders, fsm_step_runs and faults land at
+// once, fsm_events in ~10s batches. So rows for an order keep arriving after it closed. On 2 Oct
+// a late fsm_event of ORD-643d01e32bd1 was routed through ensureInterval and closed the chained
+// ORD-d98c0c48d492 at birth (`aborted`, 0 ms) — the 29 Sep fix covered late step runs only, and
+// 63 drinks read as failed in a week. The rule therefore applies to every row kind:
+//
+//   - never while another drink is open: a row for X cannot be allowed to close Y;
+//   - never once X is over (completed, or faulted beyond recovery);
+//   - never for a row from X's own past (at or before its close).
+//
+// What is left is a drink resuming after a recoverable fault or the duration cap, which reopens
+// its own interval as before.
+func (t *tracker) isLateForClosedOrder(orderKey string, atMS int64) bool {
 	if orderKey == "" {
 		return false
 	}
-	if _, ok := t.closedOrders[orderKey]; !ok {
+	c, ok := t.closedOrders[orderKey]
+	if !ok {
 		return false
 	}
-	return t.current == nil || t.current.orderKey != orderKey
+	if t.current != nil && t.current.orderKey == orderKey {
+		return false
+	}
+	if t.current != nil && t.current.isProduction {
+		return true
+	}
+	if c.lastResult == resultCompleted || c.lastResult == resultFaultedNonRecoverable {
+		return true
+	}
+	return atMS <= c.endedMS
+}
+
+// lateFragment returns a detached interval carrying a closed order's context, queued for
+// writing. Its cycles row is a no-op against the one already written (the upsert keeps the
+// first), so only its children land — under the right order_id, result and recipe.
+func (t *tracker) lateFragment(orderKey string) *interval {
+	c := t.closedOrders[orderKey]
+	frag := newInterval(orderKey, true, c.startedMS, c.result)
+	frag.endedMS = c.endedMS
+	frag.recipeID = c.recipeID
+	frag.glassCount = c.glassCount
+	frag.detached = true
+	t.closed = append(t.closed, frag)
+	return frag
+}
+
+// deferredFaultWindowMS bounds how long after step 19 a fault still belongs to the drink.
+//
+// The firmware suppresses some faults while an order runs and raises them from the step-19
+// handler once it is done — "hopper empty fault: detected during order … raised after order
+// complete" (fsm/autocycle.go). They arrive milliseconds after the completion marker: ORD-
+// 90af3b139eca reached step 19 at 06:20:20.114 and raised HopperEmptyFault at .117 (2 Oct).
+// Which of the two the projector happened to see first used to decide whether that drink read
+// `completed` or `recovered`. The fault happened during the drink, so it is the drink's.
+const deferredFaultWindowMS = 5_000
+
+// deferredFaultTarget returns the still-unwritten interval of an order that completed at step
+// 19 moments before a fault it raised at step 19, or nil. PendingIntervals holds a completed
+// interval for this window so the amendment always lands before the row is written — the
+// cloud keeps the first row it receives, so it cannot be corrected afterwards.
+func (t *tracker) deferredFaultTarget(orderKey string, step, atMS int64) *interval {
+	c, ok := t.closedOrders[orderKey]
+	if !ok || step != autoCycleCompleteStep || c.lastResult != resultCompleted ||
+		atMS < c.endedMS || atMS-c.endedMS > deferredFaultWindowMS {
+		return nil
+	}
+	for _, iv := range t.closed {
+		if iv.orderKey == orderKey && !iv.detached && iv.result == resultCompleted {
+			return iv
+		}
+	}
+	return nil
+}
+
+// markDeferredFault turns a completed drink into a faulted one: it was made, and a fault was
+// found during it.
+func (t *tracker) markDeferredFault(iv *interval, severity string) {
+	iv.result = resultFaultedRecoverable
+	if severity == severityNonRecoverable {
+		iv.result = resultFaultedNonRecoverable
+	}
+	iv.dominantFaultType = dominantKey(iv.faultTypeCounts)
+	if c, ok := t.closedOrders[iv.orderKey]; ok {
+		c.result, c.lastResult = iv.result, iv.result
+	}
 }
 
 // applyLateStepRun writes a late step run to its own order without touching the open interval,
@@ -957,13 +1083,21 @@ func (t *tracker) applyLateStepRun(sr srcStepRun, actuators map[string]StepRunAc
 	seq := c.dwellSeq[lane]
 	c.dwellSeq[lane] = seq + 1
 
-	frag := newInterval(sr.OrderKey, true, c.startedMS, c.result)
-	frag.endedMS = c.endedMS
-	frag.recipeID = c.recipeID
-	frag.glassCount = c.glassCount
+	// A deferred fault amends the drink before the fragment copies its result.
+	deferred := false
+	if iv := t.deferredFaultTarget(sr.OrderKey, sr.Step, endMS); iv != nil && sr.FaultType != "" {
+		before := iv.faultCount
+		t.applyStepRunFault(iv, sr, startMS, endMS, seq)
+		if iv.faultCount > before {
+			t.markDeferredFault(iv, t.severity(sr.FaultType))
+		}
+		deferred = true
+	}
+	frag := t.lateFragment(sr.OrderKey)
 	appendStepRun(frag, sr, actuators, startMS, endMS, lane, seq)
-	t.applyStepRunFault(frag, sr, startMS, endMS, seq)
-	t.closed = append(t.closed, frag)
+	if !deferred {
+		t.applyStepRunFault(frag, sr, startMS, endMS, seq)
+	}
 }
 
 // appendStepRun adds one step run's dwell and per-output actuator totals to iv.
@@ -1120,14 +1254,22 @@ func (t *tracker) closeDoorEpisode(s srcSensorToggle, atMS int64) {
 
 func (t *tracker) ApplySensorToggle(s srcSensorToggle) {
 	atMS := s.TS.UnixMilli()
-	t.ensureInterval(s.OrderKey, s.CurrentState, atMS)
-	if t.current == nil {
+	var iv *interval
+	if t.isLateForClosedOrder(s.OrderKey, atMS) {
+		iv = t.lateFragment(s.OrderKey)
+	} else {
+		t.ensureInterval(s.OrderKey, s.CurrentState, atMS)
+		iv = t.current
+	}
+	if iv == nil {
 		return
 	}
+	// Door episodes are physical and follow the toggles table's own order, whichever order
+	// the row is keyed to.
 	t.applyDoorSignals(s, atMS)
-	t.current.toggles = append(t.current.toggles, outSensorToggle{
+	iv.toggles = append(iv.toggles, outSensorToggle{
 		eventAtMS:    atMS,
-		orderKey:     t.current.orderKey,
+		orderKey:     iv.orderKey,
 		srcID:        s.ID,
 		inputID:      s.InputID,
 		inputName:    s.InputName,
@@ -1178,13 +1320,31 @@ func (t *tracker) FlushOpen(atMS int64) {
 	if t.current.isProduction {
 		forced = resultAborted
 	}
-	t.closeInterval(atMS, forced)
+	t.closeInterval(atMS, forced, closeShutdown)
 }
 
 // PendingIntervals hands over everything closed since the last call.
-func (t *tracker) PendingIntervals() []*interval {
-	out := t.closed
-	t.closed = nil
+//
+// A drink completed less than deferredFaultWindowMS before timelineMS is held back, with any late
+// fragments of it, so a deferred fault can still amend it (see deferredFaultTarget). Pass
+// math.MaxInt64 to release everything.
+func (t *tracker) PendingIntervals(timelineMS int64) []*interval {
+	held := map[string]bool{}
+	for _, iv := range t.closed {
+		if !iv.detached && iv.isProduction && iv.result == resultCompleted &&
+			timelineMS-iv.endedMS < deferredFaultWindowMS {
+			held[iv.orderKey] = true
+		}
+	}
+	var out, keep []*interval
+	for _, iv := range t.closed {
+		if held[iv.orderKey] {
+			keep = append(keep, iv)
+		} else {
+			out = append(out, iv)
+		}
+	}
+	t.closed = keep
 	sort.SliceStable(out, func(i, j int) bool { return out[i].endedMS < out[j].endedMS })
 	return out
 }
