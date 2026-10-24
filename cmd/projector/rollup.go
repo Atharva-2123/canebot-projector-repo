@@ -25,10 +25,9 @@ const (
 	hourMS = int64(time.Hour / time.Millisecond)
 	dayMS  = 24 * hourMS
 
-	// The firmware's own completion marker for the CIP cycle: Maintenance step 7 is labelled
-	// "CIP cycle complete - reset maintenance timer and glass count" (fsm/step_metadata.go).
-	// Same role as AutoCycle step 19 for a drink.
-	cipCompleteStep = 7
+	// The current Maintenance handler completes at step 3. The older step_metadata.go
+	// still describes a seven-step handler; use -cip-completion-step=7 only for that firmware.
+	cipCompleteStep = 3
 )
 
 // emitDerived writes everything that can be derived from already-flushed rows. upToMS is the
@@ -64,123 +63,15 @@ func (p *projector) emitDerived(ctx context.Context, upToMS int64) error {
 	if err := p.emitCIPRuns(ctx, upToMS); err != nil {
 		return err
 	}
-	if err := p.emitHourly(ctx, upToMS); err != nil {
+	rollupTo := p.cipRollupThrough(upToMS)
+	if err := p.emitHourly(ctx, rollupTo); err != nil {
 		return err
 	}
-	if err := p.emitDaily(ctx, upToMS); err != nil {
+	if err := p.emitDaily(ctx, rollupTo); err != nil {
 		return err
 	}
 	// Last, so nothing already shipping waits on it.
 	return p.emitFaultIncidents(ctx)
-}
-
-// ---------------------------------------------------------------------------
-// cip_runs
-// ---------------------------------------------------------------------------
-
-// emitCIPRuns turns each closed Maintenance span into one CIP run.
-//
-// Maintenance IS the CIP cycle in this firmware — getMaintenanceStepMetadata describes the
-// Maintenance steps as the CIP sequence — so a span in that state is a run, and reaching step 7
-// within it is the firmware saying the run completed rather than being interrupted.
-//
-// This replaces a dashboard KPI whose value changes when you change the date range, because it
-// counts time buckets containing any CIP row rather than actual runs.
-func (p *projector) emitCIPRuns(ctx context.Context, upToMS int64) error {
-	_, last, err := p.st.Cursor("cip_runs")
-	if err != nil {
-		return err
-	}
-
-	rows, err := p.rep.db.QueryContext(ctx,
-		`SELECT entered_at_ms, exited_at_ms, order_id
-		   FROM state_durations
-		  WHERE state LIKE 'Maintenance%' AND exited_at_ms > ? AND exited_at_ms <= ?
-		  ORDER BY exited_at_ms`, last, upToMS)
-	if err != nil {
-		return fmt.Errorf("read maintenance spans: %w", err)
-	}
-	type span struct {
-		started, ended int64
-		orderKey       string
-	}
-	var spans []span
-	for rows.Next() {
-		var s span
-		if err := rows.Scan(&s.started, &s.ended, &s.orderKey); err != nil {
-			rows.Close()
-			return err
-		}
-		spans = append(spans, s)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	high := last
-	for _, s := range spans {
-		// Two places, because fsm_events is no longer replicated and neither source alone
-		// covers every controller:
-		//
-		//   step_dwells        the step-run branch writes the dwell directly; on the base
-		//                      branch the same dwell is derived from fsm_events before they
-		//                      are discarded. Maintenance dwells are exempt from idle
-		//                      suppression precisely so this keeps working.
-		//   cycles             a controller that has fsm_step_runs but does not write step
-		//                      runs for Maintenance leaves no dwell at all. The events still
-		//                      pass through the tracker, so the interval records step 7 as
-		//                      where it ended.
-		//
-		// Missing the marker downgrades a finished clean to "interrupted", which is why this
-		// is worth checking twice rather than trusting one path.
-		var completed int64
-		if err := p.rep.db.QueryRowContext(ctx,
-			`SELECT EXISTS(
-			   SELECT 1 FROM step_dwells
-			    WHERE state LIKE 'Maintenance%' AND step = ?
-			      AND started_at_ms >= ? AND started_at_ms < ?
-			   UNION ALL
-			   SELECT 1 FROM cycles
-			    WHERE result = 'maintenance' AND terminal_step = ?
-			      AND started_at_ms >= ? AND started_at_ms < ?)`,
-			cipCompleteStep, s.started, s.ended,
-			cipCompleteStep, s.started, s.ended).Scan(&completed); err != nil {
-			return fmt.Errorf("cip completion probe: %w", err)
-		}
-
-		var faultCount int64
-		if err := p.rep.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM fault_events WHERE raised_at_ms >= ? AND raised_at_ms < ?`,
-			s.started, s.ended).Scan(&faultCount); err != nil {
-			return fmt.Errorf("cip fault count: %w", err)
-		}
-
-		ts, err := p.rep.guard("cip_runs", s.ended)
-		if err != nil {
-			return err
-		}
-		// No trigger_source column. It was always NULL — the controller records no distinction
-		// between an automatic clean (the maintenance counter reaching MaintenanceCount) and one
-		// an operator started. A column that can never hold a value is not a documented gap; it
-		// is a gap hidden behind something that looks queryable.
-		if _, err := p.rep.db.ExecContext(ctx,
-			`INSERT INTO cip_runs (event_ts, started_at_ms, ended_at_ms, duration_ms, order_id,
-			                       completed, fault_count, date_utc)
-			 VALUES (?,?,?,?,?,?,?,?)`,
-			ts, s.started, s.ended, s.ended-s.started, s.orderKey,
-			completed, faultCount, dateUTC(s.started),
-		); err != nil {
-			return fmt.Errorf("insert cip_run: %w", err)
-		}
-		p.rep.st.SetWatermark("cip_runs", ts)
-		high = s.ended
-	}
-
-	if high == last {
-		return nil
-	}
-	return p.st.SetCursor("cip_runs", 0, high)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +143,7 @@ func (p *projector) emitHourBucket(ctx context.Context, bucketStart int64) error
 		return err
 	}
 	if err := p.rep.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM cip_runs WHERE started_at_ms >= ? AND started_at_ms < ?`,
+		`SELECT COUNT(*) FROM cip_runs WHERE completed = 1 AND ended_at_ms >= ? AND ended_at_ms < ?`,
 		bucketStart, bucketEnd).
 		Scan(&cipCount); err != nil {
 		return err
@@ -445,9 +336,14 @@ func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
 		return err
 	}
 
-	var faultCount int64
+	var faultCount, cipCount int64
 	if err := p.rep.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM fault_events WHERE date_utc = ?`, date).Scan(&faultCount); err != nil {
+		return err
+	}
+	if err := p.rep.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM cip_runs WHERE completed = 1 AND ended_at_ms >= ? AND ended_at_ms < ?`,
+		dayStart, dayEnd).Scan(&cipCount); err != nil {
 		return err
 	}
 
@@ -457,13 +353,13 @@ func (p *projector) emitDayBucket(ctx context.Context, dayStart int64) error {
 	}
 	if _, err := p.rep.db.ExecContext(ctx,
 		`INSERT INTO rollups (event_ts, grain, bucket_start_ms, date_utc, dim_kind, dim_key,
-		                      glasses, orders_completed, orders_faulted, fault_count,
+		                      glasses, orders_completed, orders_faulted, fault_count, cip_runs,
 		                      cycle_ms_sum, cycle_count,
 		                      run_ms, error_ms, maintenance_ms, idle_ms)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(grain, bucket_start_ms, dim_kind, dim_key) DO NOTHING`,
 		ts, grainDay, dayStart, date, dimMachine, nil, agg.glasses,
-		agg.completed, agg.faulted, faultCount,
+		agg.completed, agg.faulted, faultCount, cipCount,
 		agg.cycleMS, agg.cycleCount,
 		occupancy.run, occupancy.errored, occupancy.maintenance, occupancy.idle,
 	); err != nil {

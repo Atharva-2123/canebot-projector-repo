@@ -1361,7 +1361,7 @@ func TestSnapshotReachesTheReplicaAsBits(t *testing.T) {
 }
 
 // seedMaintenanceCIP drives a full CIP cycle: HomeIdle -> Maintenance, the CIP steps, then
-// back out. reachComplete controls whether step 7 ("CIP cycle complete") is reached.
+// back out. reachComplete controls whether step 3 ("CIP cycle complete") is reached.
 func seedMaintenanceCIP(t *testing.T, db *sql.DB, start time.Time, reachComplete bool) time.Time {
 	t.Helper()
 	return seedMaintenanceCIPState(t, db, start, reachComplete, "Maintenance")
@@ -1373,7 +1373,7 @@ func seedMaintenanceCIP(t *testing.T, db *sql.DB, start time.Time, reachComplete
 func seedMaintenanceCIPState(t *testing.T, db *sql.DB, start time.Time, reachComplete bool, state string) time.Time {
 	t.Helper()
 	seedTransition(t, db, "", "HomeIdle", state, start)
-	steps := []int{0, 10, 1, 2, 3, 4, 5, 6}
+	steps := []int{0, 1, 2}
 	if reachComplete {
 		steps = append(steps, cipCompleteStep)
 	}
@@ -1428,7 +1428,7 @@ func TestCIPRunEmittedFromSuffixedMaintenanceState(t *testing.T) {
 }
 
 // TestCIPRunEmittedFromMaintenanceSpan: Maintenance IS the CIP cycle in this firmware, so a
-// closed span in that state is one run, and step 7 is the firmware's own completion marker.
+// logical cycle in that state is one run, and step 3 is the firmware's own completion marker.
 func TestCIPRunEmittedFromMaintenanceSpan(t *testing.T) {
 	sourcePath, db := newSourceDB(t)
 
@@ -1456,7 +1456,7 @@ func TestCIPRunEmittedFromMaintenanceSpan(t *testing.T) {
 	}
 }
 
-// TestCIPRunInterruptedIsNotCompleted — a clean that never reached step 7 is a real run that
+// TestCIPRunInterruptedIsNotCompleted — a clean that never reached step 3 is a real run that
 // did not finish, which is exactly the distinction the current dashboard cannot make.
 func TestCIPRunInterruptedIsNotCompleted(t *testing.T) {
 	sourcePath, db := newSourceDB(t)

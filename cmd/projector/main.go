@@ -35,7 +35,7 @@ import (
 
 const (
 	defaultBatchSize = 500
-	version          = "0.1.0"
+	version          = "0.1.1-cip"
 )
 
 // Fault severity. The firmware is the source of truth for this — fault_catalog.csv carries a
@@ -85,13 +85,16 @@ func main() {
 		once        = flag.Bool("once", false, "run a single pass and exit (useful for tests and backfill)")
 		settle      = flag.Duration("settle", defaultSettle, "apply a source row only once it is this old, so every controller table has caught up to it (0: off)")
 		verboseFlag = flag.Bool("v", false, "verbose logging")
+		cipStep     = flag.Int("cip-completion-step", cipCompleteStep, "Maintenance completion step for the deployed firmware (3: current CIP handler, 7: legacy handler)")
 
 		fsmLog          = flag.String("fsm-log", "", "controller stdout log to tail into fsm_logs (empty: off, and the table is never created)")
 		fsmLogRetention = flag.Duration("fsm-log-retention", 48*time.Hour, "delete fsm_logs rows older than this once omega has delivered them")
 		fsmLogMaxAge    = flag.Duration("fsm-log-max-age", 7*24*time.Hour, "delete fsm_logs rows older than this whether delivered or not")
 		fsmLogOmega     = flag.String("fsm-log-omega-state", "", "state db of the omega whose delivery allows -fsm-log-retention (empty: only -fsm-log-max-age applies)")
 		fsmLogDigest    = flag.Duration("fsm-log-digest", time.Minute, "collapse a line repeating within this window into one row (0: keep every line)")
-		fsmLogPrune     = flag.Bool("fsm-log-prune-file", false, "cut lines off the start of -fsm-log once omega at -fsm-log-omega-state has delivered them")
+		fsmLogPrune     = flag.Bool("fsm-log-prune-file", false, "cut lines off the start of -fsm-log once older than -fsm-log-file-max-age, or while the file is over -fsm-log-file-max-gb")
+		fsmLogFileAge   = flag.Duration("fsm-log-file-max-age", 72*time.Hour, "with -fsm-log-prune-file, cut lines logged longer ago than this (0: no age limit)")
+		fsmLogFileGB    = flag.Int("fsm-log-file-max-gb", 20, "with -fsm-log-prune-file, enforce this size cap even if old bytes have not reached fsm_logs (0: no cap; newest -fsm-log-keep-mb always stays)")
 		fsmLogKeepMB    = flag.Int("fsm-log-keep-mb", 8, "with -fsm-log-prune-file, always leave at least this much of the log in the file")
 	)
 	flag.Parse()
@@ -100,9 +103,11 @@ func main() {
 	if err := runWith(options{
 		sourcePath: *sourcePath, replicaPath: *replicaPath, statePath: *statePath,
 		interval: *interval, batchSize: *batchSize, retention: *retention, once: *once, settle: *settle,
-		fsmLogPath: *fsmLog, fsmLogRetention: *fsmLogRetention, fsmLogMaxAge: *fsmLogMaxAge,
+		cipCompletionStep: *cipStep,
+		fsmLogPath:        *fsmLog, fsmLogRetention: *fsmLogRetention, fsmLogMaxAge: *fsmLogMaxAge,
 		fsmLogOmegaState: *fsmLogOmega, fsmLogDigest: *fsmLogDigest,
 		fsmLogPruneFile: *fsmLogPrune, fsmLogKeepBytes: int64(*fsmLogKeepMB) << 20,
+		fsmLogFileMaxAge: *fsmLogFileAge, fsmLogFileMaxBytes: int64(*fsmLogFileGB) << 30,
 	}); err != nil {
 		log.Fatalf("projector: %v", err)
 	}
@@ -115,14 +120,17 @@ type options struct {
 	retention                          time.Duration
 	once                               bool
 	settle                             time.Duration
+	cipCompletionStep                  int
 
-	fsmLogPath       string
-	fsmLogRetention  time.Duration
-	fsmLogMaxAge     time.Duration
-	fsmLogOmegaState string
-	fsmLogDigest     time.Duration
-	fsmLogPruneFile  bool
-	fsmLogKeepBytes  int64
+	fsmLogPath         string
+	fsmLogRetention    time.Duration
+	fsmLogMaxAge       time.Duration
+	fsmLogOmegaState   string
+	fsmLogDigest       time.Duration
+	fsmLogPruneFile    bool
+	fsmLogKeepBytes    int64
+	fsmLogFileMaxAge   time.Duration
+	fsmLogFileMaxBytes int64
 }
 
 func run(sourcePath, replicaPath, statePath string, interval time.Duration,
@@ -136,10 +144,15 @@ func run(sourcePath, replicaPath, statePath string, interval time.Duration,
 func runWith(o options) error {
 	sourcePath, replicaPath, statePath := o.sourcePath, o.replicaPath, o.statePath
 	interval, batchSize, retention, once := o.interval, o.batchSize, o.retention, o.once
+	if o.cipCompletionStep == 0 {
+		o.cipCompletionStep = cipCompleteStep
+	}
+	if o.cipCompletionStep != 3 && o.cipCompletionStep != 7 {
+		return fmt.Errorf("-cip-completion-step must be 3 (current firmware) or 7 (legacy firmware)")
+	}
 
-	if o.fsmLogPruneFile && (o.fsmLogPath == "" || o.fsmLogOmegaState == "") {
-		// Pruning without a delivery source would have to cut lines nobody confirmed shipped.
-		return fmt.Errorf("-fsm-log-prune-file needs -fsm-log and -fsm-log-omega-state")
+	if o.fsmLogPruneFile && o.fsmLogPath == "" {
+		return fmt.Errorf("-fsm-log-prune-file needs -fsm-log")
 	}
 	if _, err := os.Stat(sourcePath); err != nil {
 		return fmt.Errorf("source database %s: %w", sourcePath, err)
@@ -163,7 +176,9 @@ func runWith(o options) error {
 	}
 	defer rep.Close()
 
-	p := &projector{src: src, rep: rep, st: st, trk: newTracker(severityFor), settle: o.settle}
+	p := &projector{src: src, rep: rep, st: st, trk: newTracker(severityFor), settle: o.settle,
+		cipCompletionStep: int64(o.cipCompletionStep)}
+	log.Printf("projector: version=%s CIP completion step=%d (logical cycles; completed-only rollups)", version, o.cipCompletionStep)
 	if once {
 		// A -once run is a backfill or a test: everything in the source is already written.
 		p.settle = 0
@@ -223,7 +238,8 @@ func runWith(o options) error {
 	if o.fsmLogPath != "" {
 		tail = newLogTailer(o.fsmLogPath, rep, st, o.fsmLogDigest)
 		if o.fsmLogPruneFile {
-			tail.pruneOmegaState, tail.pruneKeep = o.fsmLogOmegaState, o.fsmLogKeepBytes
+			tail.pruneOn, tail.pruneKeep = true, o.fsmLogKeepBytes
+			tail.pruneMaxAge, tail.pruneMaxBytes = o.fsmLogFileMaxAge, o.fsmLogFileMaxBytes
 		}
 	}
 
@@ -327,6 +343,11 @@ type projector struct {
 	rep *replicaWriter
 	st  *stateStore
 	trk *tracker
+
+	cipCompletionStep int64
+	// A logical clean with unflushed evidence can still contribute to this bucket.
+	// Do not freeze an hourly/day count before that evidence has been emitted.
+	cipRollupMS int64
 
 	// lastTimelineMS is the furthest point on the machine's timeline we have applied. Derived
 	// tables are bounded by it rather than by wall-clock now, so a bucket is only finalised

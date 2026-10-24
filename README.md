@@ -174,12 +174,36 @@ row per line. Off by default, and the table is not created until it is on.
 - **Without pruning the log file is never written.** Rotate it however you like — copy-then-
   truncate keeps the lines written just before the cut, because the tail reads `<log>.1` first.
 
+## CIP cycle counting
+
+`cip_runs` contains one record per logical cleaning cycle or interrupted attempt. Internal
+interval changes do not create another cleaning cycle. A command-driven CIP loop produces
+one completed record per iteration. A projector shutdown does not end the machine's clean.
+
+The current Maintenance handler completes at step **3**. This is the default for
+`-cip-completion-step`. Use `-cip-completion-step=7` only with the older seven-step handler.
+The old firmware metadata still describes step 7; it does not select the deployed handler.
+
+`completed=1` means a completion marker was recorded. `completed=0` means the machine left
+Maintenance before completion. Hourly and daily machine rollups count only completed cycles,
+using `ended_at_ms` to select the completion hour/day. Buffered closing steps delay rollup
+finalisation, so an hour is not permanently written as zero before its completion arrives.
+
+This update requires no database schema change or cursor reset. It continues from the existing
+CIP cursor and writes future records through the normal projector path. Existing CIP records
+and rollups remain unchanged. Correcting historical totals is a separate operation; do not
+rebuild records or reset any database as part of a binary-only deployment.
+
+The regression fixture in `cmd/projector/testdata/cip-fragments-20261014.json` is a small
+read-only export. Local replay converts its 31 Maintenance fragments into six completed cycles
+and two interrupted attempts. Tests create all working databases in temporary directories.
+
 ## Notes
 
 - `projector_state.db` and `omega/state.db` are **separate on purpose**. Neither belongs in a
   sync policy; omega auto-enrols any table it finds in the database it is pointed at.
 - Back both up alongside the replica. Losing them causes duplicate publishes.
-- All 17 tables are populated. `cip_runs` comes from Maintenance spans; the four rollups are
+- `cip_runs` comes from logical Maintenance cycles and their completion steps. Rollups are
   aggregated from the replica's own finished tables once a bucket has closed.
 - **A table created empty and populated later is silently skipped by omega.** Reading zero rows
   marks its snapshot done, and thereafter the cursor is fast-forwarded past everything that

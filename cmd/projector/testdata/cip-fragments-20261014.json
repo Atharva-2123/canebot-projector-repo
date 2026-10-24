@@ -1,0 +1,498 @@
+{
+  "states": [
+    {
+      "entered_at_ms": 1791969220775,
+      "exited_at_ms": 1791969220827,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919692207740496"
+    },
+    {
+      "entered_at_ms": 1791969220827,
+      "exited_at_ms": 1791969226833,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919692208270497"
+    },
+    {
+      "entered_at_ms": 1791969226833,
+      "exited_at_ms": 1791969229238,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919692268330498"
+    },
+    {
+      "entered_at_ms": 1791969229238,
+      "exited_at_ms": 1791969310433,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919692292380499"
+    },
+    {
+      "entered_at_ms": 1791969310433,
+      "exited_at_ms": 1791969310687,
+      "state": "HomeIdle",
+      "order_id": "MAINT-17919693104250501"
+    },
+    {
+      "entered_at_ms": 1791984663705,
+      "exited_at_ms": 1791984663779,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919846637050548"
+    },
+    {
+      "entered_at_ms": 1791984663779,
+      "exited_at_ms": 1791984663781,
+      "state": "Manual",
+      "order_id": "MAINT-17919846637580550"
+    },
+    {
+      "entered_at_ms": 1791984664728,
+      "exited_at_ms": 1791984664788,
+      "state": "Maintenance_regular",
+      "order_id": "MANUAL-17919846637790553"
+    },
+    {
+      "entered_at_ms": 1791984664788,
+      "exited_at_ms": 1791984664794,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919846647880554"
+    },
+    {
+      "entered_at_ms": 1791984664794,
+      "exited_at_ms": 1791984664796,
+      "state": "Manual",
+      "order_id": "MAINT-17919846647280556"
+    },
+    {
+      "entered_at_ms": 1791984665944,
+      "exited_at_ms": 1791984667013,
+      "state": "Maintenance_regular",
+      "order_id": "MANUAL-17919846647940559"
+    },
+    {
+      "entered_at_ms": 1791984667013,
+      "exited_at_ms": 1791984672001,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919846670130560"
+    },
+    {
+      "entered_at_ms": 1791984672001,
+      "exited_at_ms": 1791984674387,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919846720010561"
+    },
+    {
+      "entered_at_ms": 1791984674387,
+      "exited_at_ms": 1791984736208,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919846743870562"
+    },
+    {
+      "entered_at_ms": 1791984736208,
+      "exited_at_ms": 1791984754125,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919847362080563"
+    },
+    {
+      "entered_at_ms": 1791984754125,
+      "exited_at_ms": 1791984754136,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919847541250564"
+    },
+    {
+      "entered_at_ms": 1791984754136,
+      "exited_at_ms": 1791984754389,
+      "state": "HomeIdle",
+      "order_id": "MAINT-17919847541300566"
+    },
+    {
+      "entered_at_ms": 1791999154299,
+      "exited_at_ms": 1791999154351,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919991542970619"
+    },
+    {
+      "entered_at_ms": 1791999154351,
+      "exited_at_ms": 1791999160358,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919991543510620"
+    },
+    {
+      "entered_at_ms": 1791999160358,
+      "exited_at_ms": 1791999160507,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17919991603580621"
+    },
+    {
+      "entered_at_ms": 1791999160507,
+      "exited_at_ms": 1791999242385,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17919991605070622"
+    },
+    {
+      "entered_at_ms": 1791999242385,
+      "exited_at_ms": 1792000142438,
+      "state": "HomeIdle",
+      "order_id": "IDLE-17919992423850625"
+    },
+    {
+      "entered_at_ms": 1792013642435,
+      "exited_at_ms": 1792013642487,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920136424340659"
+    },
+    {
+      "entered_at_ms": 1792013642487,
+      "exited_at_ms": 1792013646991,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920136424870660"
+    },
+    {
+      "entered_at_ms": 1792013646991,
+      "exited_at_ms": 1792013649336,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920136469910661"
+    },
+    {
+      "entered_at_ms": 1792013649336,
+      "exited_at_ms": 1792013721252,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920136493360662"
+    },
+    {
+      "entered_at_ms": 1792013721252,
+      "exited_at_ms": 1792013729108,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920137212520663"
+    },
+    {
+      "entered_at_ms": 1792013729108,
+      "exited_at_ms": 1792013729117,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920137291080664"
+    },
+    {
+      "entered_at_ms": 1792013729117,
+      "exited_at_ms": 1792013729370,
+      "state": "HomeIdle",
+      "order_id": "MAINT-17920137291140666"
+    },
+    {
+      "entered_at_ms": 1792028129205,
+      "exited_at_ms": 1792028129257,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920281292040707"
+    },
+    {
+      "entered_at_ms": 1792028129257,
+      "exited_at_ms": 1792028207278,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920281292570708"
+    },
+    {
+      "entered_at_ms": 1792028207278,
+      "exited_at_ms": 1792028207530,
+      "state": "HomeIdle",
+      "order_id": "MAINT-17920282072740710"
+    },
+    {
+      "entered_at_ms": 1792042607429,
+      "exited_at_ms": 1792042607482,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920426074220734"
+    },
+    {
+      "entered_at_ms": 1792042607482,
+      "exited_at_ms": 1792042613487,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920426074820735"
+    },
+    {
+      "entered_at_ms": 1792042613487,
+      "exited_at_ms": 1792042615798,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920426134870736"
+    },
+    {
+      "entered_at_ms": 1792042615798,
+      "exited_at_ms": 1792042688726,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920426157980737"
+    },
+    {
+      "entered_at_ms": 1792042688726,
+      "exited_at_ms": 1792042695555,
+      "state": "Maintenance_regular",
+      "order_id": "IDLE-17920426887260738"
+    },
+    {
+      "entered_at_ms": 1792042695555,
+      "exited_at_ms": 1792042695562,
+      "state": "Maintenance_regular",
+      "order_id": "MAINT-17920426955550739"
+    },
+    {
+      "entered_at_ms": 1792042695562,
+      "exited_at_ms": 1792042695815,
+      "state": "HomeIdle",
+      "order_id": "MAINT-17920426955580741"
+    }
+  ],
+  "steps": [
+    {
+      "started_at_ms": 1791969220775,
+      "ended_at_ms": 1791969220827,
+      "state": "Maintenance_regular",
+      "step": 8,
+      "order_id": "MAINT-17919692208270497",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791969220827,
+      "ended_at_ms": 1791969231090,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17919692292380499",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791969231090,
+      "ended_at_ms": 1791969310420,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17919692292380499",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791969310420,
+      "ended_at_ms": 1791969310425,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17919692292380499",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791969310425,
+      "ended_at_ms": 1791969310433,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17919693104250501",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984663705,
+      "ended_at_ms": 1791984663758,
+      "state": "Maintenance_regular",
+      "step": 19,
+      "order_id": "MAINT-17919846637050548",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984663758,
+      "ended_at_ms": 1791984663779,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17919846637580550",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984664728,
+      "ended_at_ms": 1791984664794,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17919846647280556",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984665944,
+      "ended_at_ms": 1791984676111,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17919846743870562",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984676111,
+      "ended_at_ms": 1791984754125,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17919847541250564",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984754125,
+      "ended_at_ms": 1791984754130,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17919847541250564",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791984754130,
+      "ended_at_ms": 1791984754136,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17919847541300566",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791999154299,
+      "ended_at_ms": 1791999154351,
+      "state": "Maintenance_regular",
+      "step": 8,
+      "order_id": "MAINT-17919991543510620",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791999154351,
+      "ended_at_ms": 1791999164366,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17919991605070622",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791999164366,
+      "ended_at_ms": 1791999242378,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17919991605070622",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791999242378,
+      "ended_at_ms": 1791999242382,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17919991605070622",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1791999242382,
+      "ended_at_ms": 1791999242385,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17919992423820624",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792013642435,
+      "ended_at_ms": 1792013642487,
+      "state": "Maintenance_regular",
+      "step": 8,
+      "order_id": "MAINT-17920136424870660",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792013642487,
+      "ended_at_ms": 1792013651099,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17920136493360662",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792013651099,
+      "ended_at_ms": 1792013729108,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17920137291080664",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792013729108,
+      "ended_at_ms": 1792013729114,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17920137291080664",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792013729114,
+      "ended_at_ms": 1792013729117,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17920137291140666",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792028129205,
+      "ended_at_ms": 1792028129257,
+      "state": "Maintenance_regular",
+      "step": 8,
+      "order_id": "MAINT-17920281292570708",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792028129257,
+      "ended_at_ms": 1792028129261,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17920281292570708",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792028129261,
+      "ended_at_ms": 1792028207271,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17920281292570708",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792028207271,
+      "ended_at_ms": 1792028207274,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17920281292570708",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792028207274,
+      "ended_at_ms": 1792028207278,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17920282072740710",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792042607429,
+      "ended_at_ms": 1792042607482,
+      "state": "Maintenance_regular",
+      "step": 8,
+      "order_id": "MAINT-17920426074820735",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792042607482,
+      "ended_at_ms": 1792042617545,
+      "state": "Maintenance_regular",
+      "step": 0,
+      "order_id": "MAINT-17920426157980737",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792042617545,
+      "ended_at_ms": 1792042695555,
+      "state": "Maintenance_regular",
+      "step": 1,
+      "order_id": "MAINT-17920426955550739",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792042695555,
+      "ended_at_ms": 1792042695558,
+      "state": "Maintenance_regular",
+      "step": 2,
+      "order_id": "MAINT-17920426955550739",
+      "fault_type": null
+    },
+    {
+      "started_at_ms": 1792042695558,
+      "ended_at_ms": 1792042695562,
+      "state": "Maintenance_regular",
+      "step": 3,
+      "order_id": "MAINT-17920426955580741",
+      "fault_type": null
+    }
+  ],
+  "expected_completed": 6,
+  "expected_attempts": 8
+}

@@ -8,8 +8,9 @@ package main
 // `2006/01/02 15:04:05 message`, whole seconds, in the process's local zone. The controller runs
 // with no TZ on Android, where Go's local zone is UTC, so the dates are parsed as UTC.
 //
-// fsm.log is never written, truncated or rotated from here. Rotation belongs to whatever owns
-// the file; the tailer only notices it and carries on.
+// With pruning enabled, the tailer collapses prefixes in place while the controller appends
+// to the same inode. Age cuts preserve uncopied bytes; the size cap can sacrifice them to
+// protect storage. External rotation is detected by the generation check.
 
 import (
 	"bytes"
@@ -52,17 +53,19 @@ const (
 	// the last tick but before the cut.
 	logRotatedSuffix = ".1"
 
-	// logPruneStep is the most cut off the file at once. The cut holds the file's inode lock,
+	// logPruneStep is the most removed by normal age trimming. The size cap removes the excess
+	// regardless of this step. The cut holds the file's inode lock,
 	// so the controller's log writes wait for it: measured on the machine's ext4 at ~5–8ms for
 	// 16MB and ~65ms for 256MB. Stay small; the log grows ~12MB an hour.
 	logPruneStep = 8 << 20
 	// logPruneMin is the least worth cutting. Without it a caught-up tail trims a few tens of KB
 	// every check, taking the file's lock twice a minute to reclaim almost nothing.
 	logPruneMin = 1 << 20
-	// logPruneEvery spaces out delivery checks, each of which opens omega's state db.
+	// logPruneEvery spaces out checks while there is nothing to cut. After a cut the next tick
+	// checks again, so a backlog of expired log drains at a step per tick.
 	logPruneEvery = 30 * time.Second
-	// logSnapshotsMax bounds the checkpoints kept while omega is not delivering.
-	logSnapshotsMax = 4096
+	// logAgeProbeBytes is how far past a candidate cut the age check looks for a stamped line.
+	logAgeProbeBytes = 64 << 10
 )
 
 // errCollapseUnsupported: the platform or filesystem cannot cut a file's start in place.
@@ -281,8 +284,8 @@ func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // of the oldest open window's first line, not the end of the last line read: a restart re-reads
 // from there, the rows already written are ignored as duplicates, and the counts are rebuilt.
 //
-// With pruning on, bytes whose rows the ilyama2 omega has delivered are cut off the file's
-// start — see pruneFile.
+// With pruning on, recorded bytes older than pruneMaxAge are cut off the start.
+// The size cap also discards unread bytes when necessary — see pruneFile.
 type logTailer struct {
 	path   string
 	rep    *replicaWriter
@@ -290,12 +293,14 @@ type logTailer struct {
 	window time.Duration // 0 writes every line
 	now    func() time.Time
 
-	// Pruning, off unless pruneOmegaState is set.
-	pruneOmegaState string        // the omega whose delivery allows a cut
-	pruneKeep       int64         // bytes always left in the file, delivered or not
-	pruneStep       int64         // most bytes cut at once; the controller's writes wait on it
-	pruneMin        int64         // least bytes worth a cut
-	pruneEvery      time.Duration // least time between delivery checks
+	// Pruning, off unless pruneOn.
+	pruneOn       bool
+	pruneMaxAge   time.Duration // lines logged longer ago than this are cut
+	pruneMaxBytes int64         // the file is cut back to this whatever its age (0: no cap)
+	pruneKeep     int64         // bytes always left in the file
+	pruneStep     int64         // most bytes cut at once; the controller's writes wait on it
+	pruneMin      int64         // least bytes worth a cut
+	pruneEvery    time.Duration // least time between checks that found nothing to cut
 
 	loaded     bool
 	haveCursor bool
@@ -307,17 +312,8 @@ type logTailer struct {
 	seqMS      int64
 	seq        int64
 
-	snaps         []logSnapshot // oldest first, this generation only
 	lastPrune     time.Time
 	pruneDisabled bool
-}
-
-// logSnapshot says: every byte of this generation before offset (base-relative, so it survives
-// a prune) is carried by fsm_logs rows with id <= maxID. Once omega has delivered maxID, those
-// bytes are no longer needed in the file.
-type logSnapshot struct {
-	offset int64
-	maxID  int64
 }
 
 // logDigest is one window of one repeating line.
@@ -363,7 +359,7 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 
 	if !lt.loaded {
 		if err := lt.load(); err != nil {
-			return err
+			return lt.capWithoutCursor(fi, err)
 		}
 	}
 	nowMS := lt.now().UnixMilli()
@@ -385,17 +381,29 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 			}
 		}
 		lt.cur = logCursor{fileGen: fmt.Sprintf("%d:%d:%d", dev, inode, nowMS), dev: dev, inode: inode}
-		lt.haveCursor, lt.prev, lt.snaps = true, nil, nil
+		lt.haveCursor, lt.prev = true, nil
 		// Saved before anything of the new generation is written, so a crash replays into
 		// this generation instead of minting another and writing every line twice.
 		if err := lt.st.SetLogCursor(lt.path, lt.cur); err != nil {
-			return err
+			return lt.capWithoutCursor(fi, err)
 		}
 		m := lt.tailerRow(nowMS, reason)
 		marker = &m
 	}
 
 	size := fi.Size()
+	// Enforce the size cap before reading a backlog. Otherwise the 4MB-per-tick
+	// reader, or a failed replica write, can prevent a flooded log from shrinking.
+	if lt.pruneOn && lt.capCut(size, fileBlockSize(fi)) > 0 {
+		if err := lt.pruneFile(ctx); err != nil {
+			return err
+		}
+		fi, err = os.Stat(lt.path)
+		if err != nil {
+			return err
+		}
+		size = fi.Size()
+	}
 	if err := lt.refreshHead(size); err != nil {
 		return err
 	}
@@ -438,9 +446,6 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 		if err := lt.st.SetLogCursor(lt.path, lt.resumePoint()); err != nil {
 			return err
 		}
-		if err := lt.snapshot(ctx); err != nil {
-			return err
-		}
 		// A chunk that consumed nothing cannot be helped by reading it again.
 		if caughtUp || !final || lt.cur.offset == start {
 			break
@@ -462,7 +467,7 @@ func (lt *logTailer) load() error {
 	}
 	lt.cur, lt.haveCursor, lt.loaded = c, ok, true
 	lt.open = map[string]*logDigest{}
-	lt.prev, lt.snaps = nil, nil
+	lt.prev = nil
 	if ok && c.lastLoggedMS > 0 {
 		lt.prev = &logLine{loggedAtMS: c.lastLoggedMS, level: "info", category: "other"}
 	}
@@ -476,7 +481,11 @@ func (lt *logTailer) load() error {
 func (lt *logTailer) settlePendingPrune(c logCursor) logCursor {
 	sum, n, err := fileHeadHash(lt.path, c.pendingHeadLen)
 	if err == nil && n == c.pendingHeadLen && sum == c.pendingHeadSHA {
-		c.offset -= c.pendingLen
+		if c.offset < c.pendingLen {
+			c.offset = c.pendingLen + firstCompleteLineOffset(lt.path)
+			c.lastLoggedMS = 0
+		}
+		c.offset = max(0, c.offset-c.pendingLen)
 		c.base += c.pendingLen
 		c.headLen, c.headSHA = 0, "" // re-fingerprinted from the file as it now is
 		log.Printf("projector: fsm log: completing a prune of %d bytes interrupted by a restart", c.pendingLen)
@@ -761,84 +770,60 @@ func (lt *logTailer) sequencedTS(ms int64) string {
 	return eventTS(ms + lt.seq)
 }
 
-// snapshot records a checkpoint after a successful write: every byte before the saved position
-// is now in fsm_logs, in rows up to the current max id.
-func (lt *logTailer) snapshot(ctx context.Context) error {
-	if lt.pruneOmegaState == "" || !lt.tableReady {
-		return nil
-	}
-	rp := lt.resumePoint()
-	offset := rp.base + rp.offset
-	if n := len(lt.snaps); n > 0 && lt.snaps[n-1].offset >= offset {
-		return nil // no further; the older checkpoint needs less delivered and covers as much
-	}
-	var maxID int64
-	if err := lt.rep.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM fsm_logs`).Scan(&maxID); err != nil {
-		return fmt.Errorf("fsm_logs max id: %w", err)
-	}
-	lt.snaps = append(lt.snaps, logSnapshot{offset: offset, maxID: maxID})
-	if len(lt.snaps) > logSnapshotsMax {
-		lt.snaps = lt.snaps[len(lt.snaps)-logSnapshotsMax:]
-	}
-	return nil
-}
-
-// pruneFile cuts delivered lines off the start of the log.
+// pruneFile cuts expired lines off the start of the log: those logged more than pruneMaxAge
+// ago, and, while the file is over pruneMaxBytes, the oldest whatever their age.
 //
-// A byte goes only once the rows carrying it are delivered by the omega at pruneOmegaState —
-// taken from a checkpoint, never from the read position, because a line's row can be written
-// long after the line is read (a digest waits for its window to close). pruneKeep bytes are
-// always left, so the file still holds recent history for someone reading it on the machine.
+// Age trimming removes only bytes whose rows are already in fsm_logs — never past the saved position, which
+// stops at the oldest open digest window — so a cut can lose nothing that has not been
+// recorded. Delivery to the platform is not consulted: the file is the machine's local copy and
+// keeps its days either way. The size cap is disk protection: it removes the entire excess,
+// even if copying is behind, and warns about unrecorded bytes. pruneKeep bytes are always left.
+//
+// Age is read off the first stamped line after the candidate cut, and a cut goes only when that
+// line is past pruneMaxAge — everything before it is older still. A cut is a whole pruneStep or
+// nothing, so up to a step of expired log can wait for the next line to expire.
 //
 // The cut is in place and never races the controller. It holds fsm.log open O_APPEND, so each
 // of its writes lands at the end as the file is at that instant — a truncate would drop a line
 // written between the last read and the cut; this cannot. It removes whole filesystem blocks,
-// so the file may start partway into an already-delivered line.
+// so the file may start partway into an already-recorded line.
 //
 // Crash-safe in both directions: the cut is recorded before it is made (settlePendingPrune),
 // and row keys are base-relative, so the lines that later occupy pruned offsets never collide
 // with the rows of the lines that were cut.
 func (lt *logTailer) pruneFile(ctx context.Context) error {
-	if lt.pruneOmegaState == "" || lt.pruneDisabled || len(lt.snaps) == 0 {
+	if !lt.pruneOn || lt.pruneDisabled {
 		return nil
 	}
 	now := lt.now()
-	if !lt.lastPrune.IsZero() && now.Sub(lt.lastPrune) < lt.pruneEvery {
-		return nil
-	}
-	lt.lastPrune = now
-
-	delivered, ok, why, err := omegaDelivered(ctx, lt.pruneOmegaState, fsmLogsTable)
-	if err != nil || !ok {
-		// Not an error of the tail: the file simply keeps its lines until delivery is known.
-		logf("fsm log prune skipped: %s %v", why, err)
-		return nil
-	}
-	// The newest checkpoint omega has delivered. Older ones are dropped; it is kept, because a
-	// cut capped by pruneStep or pruneKeep leaves the rest of its bytes for a later check.
-	last := -1
-	for i, s := range lt.snaps {
-		if s.maxID > delivered.rowID {
-			break
-		}
-		last = i
-	}
-	if last < 0 {
-		return nil
-	}
-	lt.snaps = lt.snaps[last:]
-	upTo := lt.snaps[0].offset
-
 	fi, err := os.Stat(lt.path)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", lt.path, err)
 	}
 	size := fi.Size()
 	block := fileBlockSize(fi)
-	cut := min(upTo-lt.cur.base, size-lt.pruneKeep, lt.pruneStep)
+	rp := lt.resumePoint()
+	recorded := rp.base + rp.offset - lt.cur.base
+	cut := lt.capCut(size, block)
+	capped := cut > 0
+	if !capped {
+		if lt.pruneMaxAge <= 0 || (!lt.lastPrune.IsZero() && now.Sub(lt.lastPrune) < lt.pruneEvery) {
+			return nil
+		}
+		lt.lastPrune = now
+		cut = min(recorded, size-lt.pruneKeep, lt.pruneStep)
+	}
 	cut -= cut % block
-	if cut <= 0 || cut < lt.pruneMin || cut >= size {
+	if cut <= 0 || (!capped && cut < lt.pruneMin) || cut >= size {
 		return nil
+	}
+	reason := fmt.Sprintf("over the %d byte cap", lt.pruneMaxBytes)
+	if !capped {
+		ms, ok, err := firstStampedMS(lt.path, cut)
+		if err != nil || !ok || ms >= now.Add(-lt.pruneMaxAge).UnixMilli() {
+			return err
+		}
+		reason = "logged over " + lt.pruneMaxAge.String() + " ago"
 	}
 
 	// Record the cut, and what the file will start with once it has, before making it.
@@ -854,7 +839,12 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	pending := lt.resumePoint()
 	pending.pendingLen, pending.pendingHeadLen, pending.pendingHeadSHA = cut, afterLen, hex.EncodeToString(sum[:])
 	if err := lt.st.SetLogCursor(lt.path, pending); err != nil {
-		return err
+		if !capped {
+			return err
+		}
+		// The cap must free space even if a full disk prevents its journal write.
+		// If interrupted, the changed head triggers the normal generation recovery.
+		log.Printf("projector: WARNING: fsm log size cap proceeding without a durable cut journal; retained log may be replayed: %v", err)
 	}
 
 	started := time.Now()
@@ -868,9 +858,24 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 		return lt.st.SetLogCursor(lt.path, lt.resumePoint())
 	}
 
-	lt.cur.offset -= cut
+	lost := max(0, cut-recorded)
+	if lost > 0 {
+		// Replay retained bytes from the oldest uncommitted digest, just as on
+		// restart. Otherwise deleting an open digest would also lose its counts
+		// for bytes that survived the cap. Existing row keys suppress duplicates.
+		lt.cur = rp
+		lt.open = map[string]*logDigest{}
+		lt.prev = nil
+		lt.cur.lastLoggedMS = 0
+		lt.cur.offset = cut + firstCompleteLineOffset(lt.path)
+	}
+	lt.cur.offset = max(0, lt.cur.offset-cut)
 	lt.cur.base += cut
-	for _, d := range lt.open {
+	for key, d := range lt.open {
+		if d.resume.offset < cut {
+			delete(lt.open, key) // this digest's raw bytes were sacrificed to the size cap
+			continue
+		}
 		d.resume.offset -= cut
 		d.resume.base += cut
 	}
@@ -878,9 +883,51 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	if err := lt.refreshHead(size - cut); err != nil {
 		return err
 	}
-	log.Printf("projector: fsm log: pruned %d delivered bytes off %s in %s",
-		cut, lt.path, time.Since(started).Round(time.Millisecond))
+	log.Printf("projector: fsm log: pruned %d bytes %s off %s in %s",
+		cut, reason, lt.path, time.Since(started).Round(time.Millisecond))
+	if lost > 0 {
+		log.Printf("projector: WARNING: fsm log size cap discarded %d bytes not yet recorded in fsm_logs; preserving disk space took priority", lost)
+	}
+	lt.lastPrune = time.Time{} // more may be due; look again next tick
 	return lt.st.SetLogCursor(lt.path, lt.resumePoint())
+}
+
+// capCut returns the entire excess, aligned to filesystem blocks. There may be
+// less than one block above the effective limit when the minimum tail wins.
+func (lt *logTailer) capCut(size, block int64) int64 {
+	if lt.pruneMaxBytes <= 0 {
+		return 0
+	}
+	over := size - max(lt.pruneMaxBytes, lt.pruneKeep)
+	if over <= 0 {
+		return 0
+	}
+	cut := min(over+block-1, size-lt.pruneKeep)
+	return cut - cut%block
+}
+
+// A cut may split a physical line. When skipping unread bytes, start after that
+// fragment so it cannot acquire "now" and pull old records' event timestamps forward.
+func firstCompleteLineOffset(path string) int64 {
+	data, err := readFileRange(path, 0, logAgeProbeBytes)
+	if err != nil {
+		return 0
+	}
+	if nl := bytes.IndexByte(data, '\n'); nl >= 0 {
+		return int64(nl + 1)
+	}
+	return 0
+}
+
+func (lt *logTailer) capWithoutCursor(fi os.FileInfo, cause error) error {
+	// Disk protection must still work when a full disk prevents cursor access.
+	if cut := lt.capCut(fi.Size(), fileBlockSize(fi)); lt.pruneOn && cut > 0 {
+		if err := collapseFileStart(lt.path, cut); err != nil {
+			return fmt.Errorf("log cursor: %v; emergency size cap: %w", cause, err)
+		}
+		log.Printf("projector: WARNING: fsm log emergency size cap removed %d bytes without a durable cursor; retained log may be replayed: %v", cut, cause)
+	}
+	return cause
 }
 
 // fileBlockSize is the filesystem block a cut must be a multiple of.
@@ -896,6 +943,27 @@ func fileIdentity(fi os.FileInfo) (dev, inode uint64) {
 		return uint64(st.Dev), uint64(st.Ino)
 	}
 	return 0, 0
+}
+
+// firstStampedMS is the time of the first dated line starting after offset, if one starts
+// within logAgeProbeBytes. Clock-only lines are skipped: their day is a guess.
+func firstStampedMS(path string, offset int64) (int64, bool, error) {
+	data, err := readFileRange(path, offset, logAgeProbeBytes)
+	if err != nil {
+		return 0, false, err
+	}
+	// offset may be partway into a line, so the first full line starts after a newline.
+	for nl := bytes.IndexByte(data, '\n'); nl >= 0; nl = bytes.IndexByte(data, '\n') {
+		data = data[nl+1:]
+		end := bytes.IndexByte(data, '\n')
+		if end < 0 {
+			break
+		}
+		if ln := parseLogLine(string(data[:end]), nil, 0); ln.tsSource == "line" {
+			return ln.loggedAtMS, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func readFileRange(path string, offset, length int64) ([]byte, error) {
