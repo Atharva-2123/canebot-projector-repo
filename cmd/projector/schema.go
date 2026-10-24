@@ -382,6 +382,26 @@ CREATE TABLE IF NOT EXISTS gaps (
     source_branch TEXT                         -- which controller schema it detected
 );
 
+-- The live fault and door state, for the platform's alarm rules. One row per change plus a
+-- heartbeat, so the cloud's latest row per machine is always the current state. See
+-- alarmstate.go. A cleared row keeps the fault's type, message and raised time: the alarm
+-- rule keys its instance on them, so the clear has to land on the same instance.
+CREATE TABLE IF NOT EXISTS alarm_state (
+    id                   INTEGER PRIMARY KEY,
+    event_ts             TEXT    NOT NULL,   -- when the row was written, strictly increasing
+    fault_active         INTEGER NOT NULL,
+    fault_type           TEXT,               -- the current, or last, fault
+    fault_message        TEXT,
+    fault_raised_at_ms   INTEGER,
+    fault_cleared_at_ms  INTEGER,
+    clear_reason         TEXT,               -- x07_reset | home_idle
+    door_open            INTEGER,            -- NULL: not yet known
+    door_opened_at_ms    INTEGER,            -- the current, or last, opening
+    machine_state        TEXT,
+    reason               TEXT    NOT NULL,   -- startup | change | heartbeat
+    date_utc             TEXT    NOT NULL
+);
+
 -- Indexes are excluded from the schema fingerprint, so these are free to add or change.
 -- order_id and the time buckets are indexed everywhere: they are the admin dashboard's
 -- primary filters.
@@ -504,6 +524,13 @@ CREATE TABLE IF NOT EXISTS config_snapshot (
 CREATE TABLE IF NOT EXISTS projector_meta (
     key   TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+
+-- The alarm_state tracker, persisted as one JSON document so the state and the fsm_events id
+-- it is accurate as of are always written together. See alarmstate.go.
+CREATE TABLE IF NOT EXISTS alarm_tracker (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    state TEXT NOT NULL
 );
 
 -- Read position in a tailed log file. dev/inode catch a replaced file, and the hash of its

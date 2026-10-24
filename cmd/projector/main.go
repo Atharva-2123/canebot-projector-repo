@@ -35,7 +35,7 @@ import (
 
 const (
 	defaultBatchSize = 500
-	version          = "0.1.1-cip"
+	version          = "0.1.2-alarm"
 )
 
 // Fault severity. The firmware is the source of truth for this — fault_catalog.csv carries a
@@ -365,6 +365,8 @@ type projector struct {
 	// applied, so a restart re-reads anything that was held.
 	held     []timelineItem
 	readUpTo map[string]int64
+
+	alarm *alarmTracker // nil until runWith loads it; see alarmstate.go
 }
 
 // defaultSettle covers the firmware's slowest writer: fsm_events are buffered and land in
@@ -420,6 +422,7 @@ func (p *projector) tick(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	p.alarmStep(ctx, items)
 	items = append(p.held, items...)
 	p.held = nil
 	// The settle window: rows younger than p.settle wait for the next tick. Every table has
@@ -534,6 +537,29 @@ func (p *projector) tick(ctx context.Context) (err error) {
 	// leaves it behind and the stretch is honestly reported as a gap.
 	p.st.MarkAlive(time.Now().UnixMilli())
 	return nil
+}
+
+// alarmStep feeds alarm_state the fsm_events this tick has just read, ahead of the settle
+// window. It never fails the tick: alarm_state shares nothing with the interval pipeline, and
+// a failure is retried on the next tick from the persisted tracker.
+func (p *projector) alarmStep(ctx context.Context, items []timelineItem) {
+	if p.alarm == nil {
+		a, err := loadAlarmTracker(ctx, p.src, p.st)
+		if err != nil {
+			log.Printf("projector: alarm_state load failed (will retry): %v", err)
+			return
+		}
+		p.alarm = a
+	}
+	var events []srcFSMEvent
+	for _, it := range items {
+		if it.kind == kindEvent {
+			events = append(events, it.event)
+		}
+	}
+	if err := p.alarm.step(ctx, p.rep, p.st, events, time.Now().UnixMilli()); err != nil {
+		log.Printf("projector: alarm_state failed (will retry): %v", err)
+	}
 }
 
 // collect reads one bounded batch from each event-ish source table.
