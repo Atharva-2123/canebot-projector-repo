@@ -171,6 +171,16 @@ row per line. Off by default, and the table is not created until it is on.
   end as the file then is — so unlike truncating it never loses a line written mid-prune. Each
   cut briefly holds the file's lock, and the controller's log writes wait for it (~5–8ms per 16MB,
   measured on the machine). The file may start partway into a line that was already delivered.
+- **Backlogs and the size cap** (`-fsm-log-file-max-gb`, 20). While behind, a tick keeps reading
+  4MB chunks for up to 2s, and each chunk that leaves more unread writes its repeat counts out
+  then — so a repeat can take several `digest` rows; `SUM(repeat_count)` is still the line count.
+  The saved position therefore follows the reader instead of staying at the first line of a
+  window. The cap cuts the file's start even when that has not been read; the reader then goes
+  on from the first whole line left, and one `tag='fsm_log_gap'` row (`ts_source='tailer'`,
+  level `warn`) says how many bytes went and between which log positions. On 27 Oct 2026 the old
+  behaviour — back to the window's start after every cut — kept the reader at a 20GB file's
+  start for days. A run of identical lines reads at ~490MB/s (Mac); error floods, a row per
+  line, at ~6MB/s.
 - **Without pruning the log file is never written.** Rotate it however you like — copy-then-
   truncate keeps the lines written just before the cut, because the tail reads `<log>.1` first.
 

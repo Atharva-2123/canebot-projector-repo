@@ -38,9 +38,11 @@ const (
 
 	// logHeadBytes is how much of the file start is fingerprinted to recognise the same file.
 	logHeadBytes = 4096
-	// logMaxReadBytes bounds one tick, so a first read of a large backlog is spread over ticks
-	// rather than held in memory at once.
+	// logMaxReadBytes bounds one chunk: what is held in memory and committed at once.
 	logMaxReadBytes = 4 << 20
+	// logDrainBudget is how long one call keeps reading chunks while behind. One chunk per
+	// 5s tick is 0.8MB/s; the 27 Oct 2026 burst wrote ~19MB/s, so a tick must read more.
+	logDrainBudget = 2 * time.Second
 	// logMaxLineBytes is where a line with no newline stops being "not finished yet" and is
 	// emitted as truncated, so one runaway line cannot stall the tail forever.
 	logMaxLineBytes = 64 << 10
@@ -284,6 +286,12 @@ func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // of the oldest open window's first line, not the end of the last line read: a restart re-reads
 // from there, the rows already written are ignored as duplicates, and the counts are rebuilt.
 //
+// That only holds while the tail is caught up, when a window spans at most a minute of log.
+// Reading a backlog, every chunk that leaves more unread writes its windows' counts out as they
+// stand (flushDigests), so the saved position is the chunk's end. On 27 Oct 2026 one window
+// held over gigabytes of a single repeated line pinned the saved position at the file's start,
+// and every size cut sent the reader back there — for days, with newer lines never read.
+//
 // With pruning on, recorded bytes older than pruneMaxAge are cut off the start.
 // The size cap also discards unread bytes when necessary — see pruneFile.
 type logTailer struct {
@@ -314,6 +322,17 @@ type logTailer struct {
 
 	lastPrune     time.Time
 	pruneDisabled bool
+
+	drainBudget time.Duration
+
+	// The last self-dated line parsed, and its raw bytes, for a run of identical lines.
+	parsedOK  bool
+	parsedRaw []byte
+	parsed    logLine
+
+	// Unread bytes the size cap discarded and no fsm_logs row reports yet: lossBytes in total,
+	// between logical positions lossFrom and lossTo.
+	lossBytes, lossFrom, lossTo int64
 }
 
 // logDigest is one window of one repeating line.
@@ -329,6 +348,7 @@ func newLogTailer(path string, rep *replicaWriter, st *stateStore, window time.D
 	return &logTailer{
 		path: path, rep: rep, st: st, window: window, now: time.Now,
 		pruneStep: logPruneStep, pruneMin: logPruneMin, pruneEvery: logPruneEvery,
+		drainBudget: logDrainBudget,
 	}
 }
 
@@ -407,8 +427,13 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 	if err := lt.refreshHead(size); err != nil {
 		return err
 	}
-	// One chunk per call in the long-running loop, so a backlog is spread across ticks. A
-	// final (-once) call has no next tick, so it reads to the end, a chunk at a time.
+	if err := lt.reportLoss(ctx); err != nil { // one a failed write left behind
+		return err
+	}
+	// A chunk at a time, each committed before the next. The long-running loop keeps reading
+	// while behind, for up to drainBudget; a final (-once) call has no next tick, so it reads
+	// to the end.
+	started := time.Now()
 	for {
 		var rows []logLine
 		start := lt.cur.offset
@@ -439,6 +464,10 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 		case caughtUp:
 			rows = append(rows, lt.closeDigests(
 				nowMS-lt.window.Milliseconds()-logDigestGrace.Milliseconds()+1)...)
+		default:
+			// More is waiting: write the counts so far, so the saved position is this chunk's
+			// end and not the first line of a window that may span the whole backlog.
+			rows = append(rows, lt.flushDigests()...)
 		}
 		if err := lt.write(ctx, rows); err != nil {
 			return err
@@ -447,11 +476,85 @@ func (lt *logTailer) Drain(ctx context.Context, final bool) (err error) {
 			return err
 		}
 		// A chunk that consumed nothing cannot be helped by reading it again.
-		if caughtUp || !final || lt.cur.offset == start {
+		if caughtUp || lt.cur.offset == start || (!final && time.Since(started) >= lt.drainBudget) {
 			break
 		}
+		// The file grows while a backlog is read; keep it under the cap between chunks.
+		if err := lt.pruneFile(ctx); err != nil {
+			return err
+		}
+		if fi, err = os.Stat(lt.path); err != nil {
+			return err
+		}
+		size = fi.Size()
 	}
 	return lt.pruneFile(ctx)
+}
+
+// flushDigests writes out every open window's repeats so far and forgets the windows, so
+// nothing read is held back and the saved position can be the read position. A window's later
+// lines start a new window — its first written as it is, the rest digested — so every line is
+// still counted exactly once, across as many rows as it took.
+//
+// Fragments are stamped at their last line, not at their window's end: a later line of the
+// same window would otherwise be dragged up to the window's end by the monotonic guard.
+func (lt *logTailer) flushDigests() []logLine {
+	var out []logLine
+	for _, d := range lt.open {
+		if d.repeats == 0 {
+			continue
+		}
+		r := d.last
+		first, last := d.firstSeenMS, d.last.loggedAtMS
+		r.tsSource, r.repeatCount = "digest", d.repeats
+		r.firstSeenMS, r.lastSeenMS = &first, &last
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].byteOffset < out[j].byteOffset })
+	lt.open = map[string]*logDigest{}
+	return out
+}
+
+// noteLoss records unread bytes between logical positions from and to that the size cap
+// discarded, for the next loss marker.
+func (lt *logTailer) noteLoss(from, to int64) {
+	if lt.lossBytes == 0 {
+		lt.lossFrom = from
+	}
+	lt.lossBytes += to - from
+	lt.lossTo = to
+}
+
+// reportLoss writes one row for the unread bytes the size cap discarded since the last such
+// row, so the loss reaches the platform and not only this process's log. It is written at once,
+// not held for later: a restart would forget it. It is stamped at the first line that survived —
+// stamped at now it would drag a backlog forward, as the started marker would — and keyed on
+// the gap's negated end, unique within a generation.
+//
+// The range can also take in lines that do have rows: a restart re-reads from its oldest open
+// window, and lines past that were written before it. It over-reports then, never under.
+func (lt *logTailer) reportLoss(ctx context.Context) error {
+	if lt.lossBytes == 0 {
+		return nil
+	}
+	now := lt.now()
+	ms, ok, err := firstStampedMS(lt.path, 0)
+	if err != nil || !ok {
+		ms = now.UnixMilli()
+	}
+	ln := logLine{
+		fileGen: lt.cur.fileGen, byteOffset: -lt.lossTo, loggedAtMS: ms,
+		tsSource: "tailer", level: "warn", category: "tailer", tag: "fsm_log_gap", repeatCount: 1,
+		message: fmt.Sprintf("fsm log size cap discarded %d bytes before they were read, "+
+			"between log positions %d and %d (seen %s); not every line there was recorded",
+			lt.lossBytes, lt.lossFrom, lt.lossTo, now.UTC().Format(time.RFC3339)),
+	}
+	ln.fingerprint = logFingerprint(ln)
+	if err := lt.write(ctx, []logLine{ln}); err != nil {
+		return err
+	}
+	lt.lossBytes = 0
+	return nil
 }
 
 func (lt *logTailer) load() error {
@@ -478,9 +581,23 @@ func (lt *logTailer) load() error {
 // file now starts with the bytes the cut would have left first, it landed and the position moves
 // with it; otherwise it never happened and the saved position stands. Either way the ordinary
 // generation checks run next.
+//
+// Those bytes prove the cut only if the file started differently before it. A repeated line can
+// make both the same (pruneFile avoids recording such cuts, older runs did not), and then only a
+// file shorter than before the cut proves it: the controller only appends. Unproven, the cut is
+// taken not to have landed — if it did, up to its length of unread log is skipped.
 func (lt *logTailer) settlePendingPrune(c logCursor) logCursor {
 	sum, n, err := fileHeadHash(lt.path, c.pendingHeadLen)
-	if err == nil && n == c.pendingHeadLen && sum == c.pendingHeadSHA {
+	landed := err == nil && n == c.pendingHeadLen && sum == c.pendingHeadSHA
+	if landed && (c.headLen != c.pendingHeadLen || c.headSHA == c.pendingHeadSHA) {
+		fi, err := os.Stat(lt.path)
+		landed = err == nil && c.pendingSize > 0 && fi.Size() < c.pendingSize
+		if !landed {
+			log.Printf("projector: WARNING: fsm log: cannot tell whether a prune of %d bytes interrupted by a restart landed; "+
+				"assuming not, so up to %d unread bytes may be skipped", c.pendingLen, c.pendingLen)
+		}
+	}
+	if landed {
 		if c.offset < c.pendingLen {
 			c.offset = c.pendingLen + firstCompleteLineOffset(lt.path)
 			c.lastLoggedMS = 0
@@ -490,7 +607,7 @@ func (lt *logTailer) settlePendingPrune(c logCursor) logCursor {
 		c.headLen, c.headSHA = 0, "" // re-fingerprinted from the file as it now is
 		log.Printf("projector: fsm log: completing a prune of %d bytes interrupted by a restart", c.pendingLen)
 	}
-	c.pendingLen, c.pendingHeadLen, c.pendingHeadSHA = 0, 0, ""
+	c.pendingLen, c.pendingHeadLen, c.pendingHeadSHA, c.pendingSize = 0, 0, "", 0
 	return c
 }
 
@@ -561,12 +678,22 @@ func (lt *logTailer) consume(data []byte, eof bool, nowMS int64) []logLine {
 		lt.cur.lineNo++
 		pos = next
 
-		// A writer without O_APPEND leaves NULs where a truncation cut; they are not text.
-		text := strings.TrimRight(string(bytes.TrimLeft(raw, "\x00")), "\r")
-		if strings.TrimSpace(text) == "" {
-			continue
+		var ln logLine
+		if lt.parsedOK && bytes.Equal(raw, lt.parsedRaw) {
+			// The last line again, byte for byte. Dated in itself, it parses the same: a burst
+			// is millions of these, and parsing each was most of the time a backlog took.
+			ln = lt.parsed
+		} else {
+			// A writer without O_APPEND leaves NULs where a truncation cut; they are not text.
+			text := strings.TrimRight(string(bytes.TrimLeft(raw, "\x00")), "\r")
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			ln = parseLogLine(text, lt.prev, nowMS)
+			if lt.parsedOK = ln.tsSource == "line"; lt.parsedOK {
+				lt.parsedRaw, lt.parsed = append(lt.parsedRaw[:0], raw...), ln
+			}
 		}
-		ln := parseLogLine(text, lt.prev, nowMS)
 		ln.fileGen, ln.byteOffset, ln.lineNo = lt.cur.fileGen, lt.cur.base+offset, lt.cur.lineNo
 		ln.truncated = ln.truncated || truncated
 		prev := ln
@@ -695,7 +822,18 @@ func (lt *logTailer) write(ctx context.Context, rows []logLine) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	tx, err := lt.rep.db.BeginTx(ctx, nil)
+	// Committed with synchronous=FULL, not the replica's NORMAL: the saved position goes to
+	// projector_state.db (FULL) after this, and must not outlive a power cut these rows did not.
+	conn, err := lt.rep.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("fsm_logs connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA synchronous = FULL`); err != nil {
+		return fmt.Errorf("fsm_logs synchronous: %w", err)
+	}
+	defer conn.ExecContext(context.Background(), `PRAGMA synchronous = NORMAL`)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin fsm_logs: %w", err)
 	}
@@ -803,9 +941,22 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	size := fi.Size()
 	block := fileBlockSize(fi)
 	rp := lt.resumePoint()
-	recorded := rp.base + rp.offset - lt.cur.base
 	cut := lt.capCut(size, block)
 	capped := cut > 0
+	if capped && cut > rp.offset && rp.offset < lt.cur.offset {
+		// The cut reaches lines an open window would re-read after a restart. Write the
+		// windows out instead, so the saved position is the read position and the cut takes
+		// only what was never read. A replica that cannot take them must not stop the cap.
+		if rows := lt.flushDigests(); len(rows) > 0 {
+			if err := lt.write(ctx, rows); err != nil {
+				log.Printf("projector: WARNING: fsm log size cap could not record %d open digest row(s) before cutting; "+
+					"their repeat counts are lost: %v", len(rows), err)
+			}
+		}
+		lt.open = map[string]*logDigest{}
+		rp = lt.resumePoint()
+	}
+	recorded := rp.base + rp.offset - lt.cur.base
 	if !capped {
 		if lt.pruneMaxAge <= 0 || (!lt.lastPrune.IsZero() && now.Sub(lt.lastPrune) < lt.pruneEvery) {
 			return nil
@@ -827,17 +978,14 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	}
 
 	// Record the cut, and what the file will start with once it has, before making it.
-	afterLen := min(size-cut, logHeadBytes)
-	data, err := readFileRange(lt.path, cut, afterLen)
-	if err != nil {
-		return err
-	}
-	if int64(len(data)) != afterLen {
-		return nil // shrank under us; the generation check sorts it out next tick
+	cut, data, err := distinctCut(lt.path, size, cut, block, lt.pruneKeep, capped)
+	if err != nil || data == nil {
+		return err // shrank under us (the generation check sorts it out next tick), or no age cut is provable
 	}
 	sum := sha256.Sum256(data)
 	pending := lt.resumePoint()
-	pending.pendingLen, pending.pendingHeadLen, pending.pendingHeadSHA = cut, afterLen, hex.EncodeToString(sum[:])
+	pending.pendingLen, pending.pendingHeadLen, pending.pendingHeadSHA = cut, int64(len(data)), hex.EncodeToString(sum[:])
+	pending.pendingSize = size
 	if err := lt.st.SetLogCursor(lt.path, pending); err != nil {
 		if !capped {
 			return err
@@ -860,14 +1008,16 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 
 	lost := max(0, cut-recorded)
 	if lost > 0 {
-		// Replay retained bytes from the oldest uncommitted digest, just as on
-		// restart. Otherwise deleting an open digest would also lose its counts
-		// for bytes that survived the cap. Existing row keys suppress duplicates.
-		lt.cur = rp
+		// The reader was behind the cut. Go on from the first whole line that survived it —
+		// never back to an older saved position: with the cap cutting again every tick, that
+		// kept the reader at the file's start for days (27 Oct 2026).
+		from := lt.cur.base + lt.cur.offset
 		lt.open = map[string]*logDigest{}
 		lt.prev = nil
 		lt.cur.lastLoggedMS = 0
 		lt.cur.offset = cut + firstCompleteLineOffset(lt.path)
+		lost = lt.cur.offset - (from - lt.cur.base)
+		lt.noteLoss(from, lt.cur.base+lt.cur.offset)
 	}
 	lt.cur.offset = max(0, lt.cur.offset-cut)
 	lt.cur.base += cut
@@ -888,8 +1038,48 @@ func (lt *logTailer) pruneFile(ctx context.Context) error {
 	if lost > 0 {
 		log.Printf("projector: WARNING: fsm log size cap discarded %d bytes not yet recorded in fsm_logs; preserving disk space took priority", lost)
 	}
+	// Also retries a report an earlier cut could not write.
+	if err := lt.reportLoss(ctx); err != nil {
+		log.Printf("projector: fsm log loss report not written yet (will retry): %v", err)
+	}
 	lt.lastPrune = time.Time{} // more may be due; look again next tick
 	return lt.st.SetLogCursor(lt.path, lt.resumePoint())
+}
+
+// distinctCut returns a cut near cut after which the file would start with different bytes than
+// it does now, and those bytes. Were they the same, a restart could not tell from the file
+// whether the cut had landed — likely when one line repeats, as it did through 20GB on
+// 27 Oct 2026. It moves the cut a block at a time: earlier or later under the cap, only earlier
+// for age (never past what is recorded). data is nil when the file shrank under it, or, for
+// age, when no nearby cut is distinct. A capped cut with none goes ahead, and
+// settlePendingPrune falls back on the file's size.
+func distinctCut(path string, size, cut, block, keep int64, capped bool) (int64, []byte, error) {
+	head, err := readFileRange(path, 0, logHeadBytes)
+	if err != nil {
+		return 0, nil, err
+	}
+	var first []byte
+	for _, step := range []int64{0, 1, -1, 2, -2, 3, -3} {
+		c := cut + step*block
+		if c <= 0 || size-c < keep || (!capped && step > 0) {
+			continue
+		}
+		n := min(size-c, logHeadBytes)
+		data, err := readFileRange(path, c, n)
+		if err != nil || int64(len(data)) != n {
+			return 0, nil, err
+		}
+		if !bytes.Equal(data, head[:min(int64(len(head)), n)]) {
+			return c, data, nil
+		}
+		if step == 0 {
+			first = data
+		}
+	}
+	if capped {
+		return cut, first, nil
+	}
+	return 0, nil, nil
 }
 
 // capCut returns the entire excess, aligned to filesystem blocks. There may be

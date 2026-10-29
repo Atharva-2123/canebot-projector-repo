@@ -554,7 +554,10 @@ CREATE TABLE IF NOT EXISTS log_cursors (
     -- once it has. A restart that finds these compares, and so knows whether the cut landed.
     pending_prune_len INTEGER NOT NULL DEFAULT 0,
     pending_head_len  INTEGER NOT NULL DEFAULT 0,
-    pending_head_sha  TEXT    NOT NULL DEFAULT ''
+    pending_head_sha  TEXT    NOT NULL DEFAULT '',
+    -- The file's size just before that prune. When the bytes after the cut repeat the bytes
+    -- before it, the hash cannot tell; a file now shorter than this can (it is only appended).
+    pending_size      INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -565,4 +568,5 @@ var logCursorColumns = []struct{ name, ddl string }{
 	{"pending_prune_len", `ALTER TABLE log_cursors ADD COLUMN pending_prune_len INTEGER NOT NULL DEFAULT 0`},
 	{"pending_head_len", `ALTER TABLE log_cursors ADD COLUMN pending_head_len INTEGER NOT NULL DEFAULT 0`},
 	{"pending_head_sha", `ALTER TABLE log_cursors ADD COLUMN pending_head_sha TEXT NOT NULL DEFAULT ''`},
+	{"pending_size", `ALTER TABLE log_cursors ADD COLUMN pending_size INTEGER NOT NULL DEFAULT 0`},
 }

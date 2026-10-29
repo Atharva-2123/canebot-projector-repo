@@ -188,6 +188,7 @@ type logCursor struct {
 	pendingLen     int64
 	pendingHeadLen int64
 	pendingHeadSHA string
+	pendingSize    int64
 }
 
 // LogCursor returns the saved read position for a log file, or ok=false if it was never read.
@@ -195,10 +196,10 @@ func (s *stateStore) LogCursor(path string) (c logCursor, ok bool, err error) {
 	var dev, inode int64
 	err = s.db.QueryRow(
 		`SELECT file_gen, dev, inode, byte_offset, line_no, head_len, head_sha256, last_logged_at_ms,
-		        base_offset, pending_prune_len, pending_head_len, pending_head_sha
+		        base_offset, pending_prune_len, pending_head_len, pending_head_sha, pending_size
 		   FROM log_cursors WHERE path = ?`, path,
 	).Scan(&c.fileGen, &dev, &inode, &c.offset, &c.lineNo, &c.headLen, &c.headSHA, &c.lastLoggedMS,
-		&c.base, &c.pendingLen, &c.pendingHeadLen, &c.pendingHeadSHA)
+		&c.base, &c.pendingLen, &c.pendingHeadLen, &c.pendingHeadSHA, &c.pendingSize)
 	if err == sql.ErrNoRows {
 		return logCursor{}, false, nil
 	}
@@ -213,18 +214,20 @@ func (s *stateStore) SetLogCursor(path string, c logCursor) error {
 	_, err := s.db.Exec(
 		`INSERT INTO log_cursors (path, file_gen, dev, inode, byte_offset, line_no,
 		                          head_len, head_sha256, last_logged_at_ms, updated_at_ms,
-		                          base_offset, pending_prune_len, pending_head_len, pending_head_sha)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		                          base_offset, pending_prune_len, pending_head_len, pending_head_sha,
+		                          pending_size)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(path) DO UPDATE SET
 		     file_gen = excluded.file_gen, dev = excluded.dev, inode = excluded.inode,
 		     byte_offset = excluded.byte_offset, line_no = excluded.line_no,
 		     head_len = excluded.head_len, head_sha256 = excluded.head_sha256,
 		     last_logged_at_ms = excluded.last_logged_at_ms, updated_at_ms = excluded.updated_at_ms,
 		     base_offset = excluded.base_offset, pending_prune_len = excluded.pending_prune_len,
-		     pending_head_len = excluded.pending_head_len, pending_head_sha = excluded.pending_head_sha`,
+		     pending_head_len = excluded.pending_head_len, pending_head_sha = excluded.pending_head_sha,
+		     pending_size = excluded.pending_size`,
 		path, c.fileGen, int64(c.dev), int64(c.inode), c.offset, c.lineNo,
 		c.headLen, c.headSHA, c.lastLoggedMS, time.Now().UnixMilli(),
-		c.base, c.pendingLen, c.pendingHeadLen, c.pendingHeadSHA)
+		c.base, c.pendingLen, c.pendingHeadLen, c.pendingHeadSHA, c.pendingSize)
 	if err != nil {
 		return fmt.Errorf("write log cursor %s: %w", path, err)
 	}
